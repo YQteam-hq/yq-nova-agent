@@ -14,4 +14,4 @@ __all__ = [
     "create_forget_tool",
     "create_memory_tools",
 ]
-__version__ = "0.3.0"
+__version__ = "0.4.0"
