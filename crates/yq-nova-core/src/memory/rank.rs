@@ -161,7 +161,7 @@ pub fn reciprocal_rank_fusion(sources: Vec<RrfSource>, smoothing_k: Option<u32>)
     let mut weights: Vec<f32> = sources.iter().map(|s| s.weight.max(0.0)).collect();
     let total: f32 = weights.iter().sum();
     if total <= 0.0 || !total.is_finite() {
-        weights = std::iter::repeat(1.0 / n_sources.max(1.0)).take(sources.len()).collect();
+        weights = std::iter::repeat_n(1.0 / n_sources.max(1.0), sources.len()).collect();
     } else {
         for w in &mut weights {
             *w /= total;

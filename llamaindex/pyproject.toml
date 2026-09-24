@@ -8,7 +8,7 @@ version = "0.4.0"
 description = "LlamaIndex memory store and tools for the yq-nova agent memory service"
 readme = "README.md"
 requires-python = ">=3.9"
-license = "BSL-1.0"
+license = "BUSL-1.1"
 keywords = ["llamaindex", "memory", "agent", "ai", "llm"]
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -20,7 +20,7 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/YQteam-dyq/yq-nova-agent"
+Homepage = "https://github.com/YQteam-hq/yq-nova-agent"
 
 [tool.setuptools.packages.find]
 include = ["llama_index_yq_nova*"]
