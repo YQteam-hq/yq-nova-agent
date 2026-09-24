@@ -16,7 +16,8 @@ use yq_nova_core::{
     },
     storage::{
         Database, MemoryFilter, MemoryRepository, MemorySortOrder, MemoryStatus,
-        SqliteMemoryRepository, parse_statuses,
+        NamespaceRepository, SqliteMemoryRepository, SqliteNamespaceRepository,
+        namespace::DEFAULT_NAMESPACE_NAME, parse_statuses,
     },
 };
 
@@ -25,6 +26,10 @@ use yq_nova_core::{
 struct Cli {
     #[arg(long, default_value = "./nova.db")]
     db_path: String,
+
+    /// Namespace every tool call is scoped to; it must already exist.
+    #[arg(long, default_value = DEFAULT_NAMESPACE_NAME)]
+    namespace: String,
 }
 
 #[derive(Deserialize)]
@@ -69,6 +74,12 @@ async fn main() -> Result<()> {
         ..Default::default()
     };
     let database = Database::open(config).await?;
+    let namespace_id = resolve_namespace_id(&database, &cli.namespace).await?;
+    tracing::info!(
+        namespace = %cli.namespace,
+        namespace_id,
+        "yq-nova-mcp scoped to namespace"
+    );
     let embedding: Arc<MockEmbeddingProvider> = Arc::new(MockEmbeddingProvider::new(64));
     let memory = MemoryService::new(database.clone(), embedding);
     let graph = GraphService::new(database.clone());
@@ -103,7 +114,7 @@ async fn main() -> Result<()> {
 
         let id = req.id.clone().unwrap_or(serde_json::Value::Null);
         let is_notification = req.id.is_none();
-        let resp = handle_request(req, &memory, &graph, &tools).await;
+        let resp = handle_request(req, &memory, &graph, &tools, namespace_id).await;
         let id = if id.is_null() { None } else { Some(id) };
 
         if is_notification {
@@ -133,6 +144,7 @@ async fn handle_request(
     memory: &MemoryService,
     graph: &GraphService,
     tools: &[ToolDef],
+    namespace_id: i64,
 ) -> HandlerResult {
     match req.method.as_str() {
         "initialize" => {
@@ -161,7 +173,7 @@ async fn handle_request(
             let params = req.params.unwrap_or(serde_json::Value::Null);
             let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(serde_json::Value::Null);
-            handle_tool_call(name, &args, memory, graph).await
+            handle_tool_call(name, &args, memory, graph, namespace_id).await
         },
         _ => HandlerResult {
             result: None,
@@ -178,16 +190,17 @@ async fn handle_tool_call(
     args: &serde_json::Value,
     memory: &MemoryService,
     graph: &GraphService,
+    namespace_id: i64,
 ) -> HandlerResult {
     let result = match name {
-        "nova_remember" => tool_remember(args, memory).await,
-        "nova_recall" => tool_recall(args, memory).await,
-        "nova_forget" => tool_forget(args, memory).await,
-        "nova_memory_update" => tool_update(args, memory).await,
-        "nova_stats" => tool_stats(memory, graph).await,
-        "nova_traverse" => tool_traverse(args, graph).await,
-        "nova_list" => tool_list(args, memory).await,
-        "nova_tags" => tool_tags(args, memory).await,
+        "nova_remember" => tool_remember(args, memory, namespace_id).await,
+        "nova_recall" => tool_recall(args, memory, namespace_id).await,
+        "nova_forget" => tool_forget(args, memory, namespace_id).await,
+        "nova_memory_update" => tool_update(args, memory, namespace_id).await,
+        "nova_stats" => tool_stats(memory, graph, namespace_id).await,
+        "nova_traverse" => tool_traverse(args, graph, namespace_id).await,
+        "nova_list" => tool_list(args, memory, namespace_id).await,
+        "nova_tags" => tool_tags(args, memory, namespace_id).await,
         _ => {
             return HandlerResult {
                 result: None,
@@ -222,6 +235,7 @@ async fn handle_tool_call(
 async fn tool_remember(
     args: &serde_json::Value,
     memory: &MemoryService,
+    namespace_id: i64,
 ) -> Result<serde_json::Value> {
     let content = args
         .get("content")
@@ -240,6 +254,7 @@ async fn tool_remember(
         importance,
         tags: &tags,
         metadata: metadata.as_ref(),
+        namespace_id,
         ..Default::default()
     };
     let out = memory.remember(input).await?;
@@ -257,6 +272,7 @@ async fn tool_remember(
 async fn tool_recall(
     args: &serde_json::Value,
     memory: &MemoryService,
+    namespace_id: i64,
 ) -> anyhow::Result<serde_json::Value> {
     let query = args
         .get("query")
@@ -275,6 +291,10 @@ async fn tool_recall(
         entity_focus,
         score_threshold: -1.0,
         similarity_threshold: -1.0,
+        filter: MemoryFilter {
+            namespace_id: Some(namespace_id),
+            ..Default::default()
+        },
         ..Default::default()
     };
     let out = memory.recall(input).await?;
@@ -284,6 +304,7 @@ async fn tool_recall(
 async fn tool_forget(
     args: &serde_json::Value,
     memory: &MemoryService,
+    namespace_id: i64,
 ) -> anyhow::Result<serde_json::Value> {
     let uuid_str = args
         .get("uuid")
@@ -300,6 +321,7 @@ async fn tool_forget(
     let input = ForgetInput {
         target: ForgetTarget::One(uuid),
         mode: forget_mode,
+        namespace_id,
         ..Default::default()
     };
     let out = memory.forget(input).await?;
@@ -309,6 +331,7 @@ async fn tool_forget(
 async fn tool_update(
     args: &serde_json::Value,
     memory: &MemoryService,
+    namespace_id: i64,
 ) -> anyhow::Result<serde_json::Value> {
     let uuid_str = args
         .get("uuid")
@@ -329,18 +352,24 @@ async fn tool_update(
         importance,
         metadata,
         tags: Some(tags),
+        namespace_id,
         ..Default::default()
     };
     let out = memory.update(uuid, input).await?;
     Ok(serde_json::to_value(out)?)
 }
 
-async fn tool_stats(memory: &MemoryService, graph: &GraphService) -> Result<serde_json::Value> {
+async fn tool_stats(
+    memory: &MemoryService,
+    graph: &GraphService,
+    namespace_id: i64,
+) -> Result<serde_json::Value> {
     let repo = SqliteMemoryRepository::new();
     let active = repo
         .count(
             &memory.database,
             &MemoryFilter {
+                namespace_id: Some(namespace_id),
                 status_in: Some(vec![MemoryStatus::Active]),
                 ..Default::default()
             },
@@ -351,6 +380,7 @@ async fn tool_stats(memory: &MemoryService, graph: &GraphService) -> Result<serd
         .count(
             &memory.database,
             &MemoryFilter {
+                namespace_id: Some(namespace_id),
                 status_in: Some(vec![MemoryStatus::Archived]),
                 ..Default::default()
             },
@@ -359,14 +389,17 @@ async fn tool_stats(memory: &MemoryService, graph: &GraphService) -> Result<serd
         .unwrap_or(0);
     let total_memories = active + archived;
 
-    let entities: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM entities")
+    let entities: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM entities WHERE namespace_id = ?1")
+        .bind(namespace_id)
         .fetch_one(&graph.database.pool)
         .await
         .unwrap_or(0);
-    let relations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM relations")
-        .fetch_one(&graph.database.pool)
-        .await
-        .unwrap_or(0);
+    let relations: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM relations WHERE namespace_id = ?1")
+            .bind(namespace_id)
+            .fetch_one(&graph.database.pool)
+            .await
+            .unwrap_or(0);
 
     Ok(serde_json::json!({
         "total_memories": total_memories,
@@ -380,6 +413,7 @@ async fn tool_stats(memory: &MemoryService, graph: &GraphService) -> Result<serd
 async fn tool_traverse(
     args: &serde_json::Value,
     graph: &GraphService,
+    namespace_id: i64,
 ) -> anyhow::Result<serde_json::Value> {
     let uuid_str = args
         .get("start_uuid")
@@ -392,9 +426,7 @@ async fn tool_traverse(
         max_depth,
         ..Default::default()
     };
-    let nodes = graph
-        .traverse_graph(yq_nova_core::storage::namespace::DEFAULT_NAMESPACE_ID, uuid, opts)
-        .await?;
+    let nodes = graph.traverse_graph(namespace_id, uuid, opts).await?;
     Ok(serde_json::to_value(nodes)?)
 }
 
@@ -412,6 +444,7 @@ fn parse_sort_order(raw: &str) -> Result<MemorySortOrder> {
 async fn tool_list(
     args: &serde_json::Value,
     memory: &MemoryService,
+    namespace_id: i64,
 ) -> anyhow::Result<serde_json::Value> {
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as u32;
     let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
@@ -431,6 +464,7 @@ async fn tool_list(
 
     let input = ListInput {
         filter: MemoryFilter {
+            namespace_id: Some(namespace_id),
             status_in: Some(status_in),
             tags_all: if tags.is_empty() { None } else { Some(tags) },
             ..Default::default()
@@ -446,11 +480,12 @@ async fn tool_list(
 async fn tool_tags(
     args: &serde_json::Value,
     memory: &MemoryService,
+    namespace_id: i64,
 ) -> anyhow::Result<serde_json::Value> {
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as u32;
     let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
     let input = TagListInput {
-        namespace_id: yq_nova_core::storage::namespace::DEFAULT_NAMESPACE_ID,
+        namespace_id,
         limit,
         offset,
     };
@@ -570,4 +605,78 @@ fn build_tool_list() -> Vec<ToolDef> {
             }),
         },
     ]
+}
+
+async fn resolve_namespace_id(db: &Database, name: &str) -> Result<i64> {
+    let name = name.trim();
+    if name.is_empty() {
+        anyhow::bail!("--namespace must not be empty");
+    }
+    let repo = SqliteNamespaceRepository::new();
+    match repo.get_by_name(db, name).await? {
+        Some(record) => Ok(record.id),
+        None => anyhow::bail!(
+            "namespace '{name}' does not exist; create it first via POST /v1/namespaces"
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use yq_nova_core::storage::namespace::{CreateNamespaceInput, DEFAULT_NAMESPACE_ID};
+
+    use super::*;
+
+    async fn temp_db(label: &str) -> Database {
+        let dir = std::env::temp_dir().join(format!(
+            "yq-nova-mcp-test-{label}-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        Database::open(StorageConfig {
+            db_path: dir.join("nova.sqlite"),
+            ..Default::default()
+        })
+        .await
+        .expect("open db")
+    }
+
+    #[tokio::test]
+    async fn default_namespace_resolves_to_the_default_id() {
+        let db = temp_db("default").await;
+        let id = resolve_namespace_id(&db, "default").await.expect("resolve default");
+        assert_eq!(id, DEFAULT_NAMESPACE_ID);
+    }
+
+    #[tokio::test]
+    async fn existing_namespace_name_resolves_to_its_id() {
+        let db = temp_db("existing").await;
+        let created = SqliteNamespaceRepository::new()
+            .create(
+                &db,
+                CreateNamespaceInput {
+                    name: "team-a",
+                    description: None,
+                    config: None,
+                },
+            )
+            .await
+            .expect("create namespace");
+        let id = resolve_namespace_id(&db, "  team-a  ").await.expect("resolve tenant");
+        assert_eq!(id, created.id);
+        assert_ne!(id, DEFAULT_NAMESPACE_ID);
+    }
+
+    #[tokio::test]
+    async fn unknown_and_empty_namespaces_are_rejected() {
+        let db = temp_db("unknown").await;
+        let err = resolve_namespace_id(&db, "nope")
+            .await
+            .expect_err("unknown namespace must be rejected");
+        assert!(err.to_string().contains("does not exist"), "{err}");
+        let err =
+            resolve_namespace_id(&db, "   ").await.expect_err("empty namespace must be rejected");
+        assert!(err.to_string().contains("must not be empty"), "{err}");
+    }
 }

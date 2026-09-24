@@ -256,6 +256,7 @@ curl 'http://127.0.0.1:7999/v1/namespaces?limit=100&offset=0'
 - Pass the `x-namespace` header to target a namespace: `curl -H 'x-namespace: team-a' ...`.
 - When `x-namespace` is absent, requests target the `default` namespace.
 - Bind per-namespace API keys in `[server].namespace_keys` (see Configuration). Requests carrying a valid namespace key are treated as tenant-scoped and restricted to that namespace; requests with the global `auth_token` are admin-scoped and may access all namespaces.
+- Pass `--namespace <name>` to `yq-nova-mcp` to scope every MCP tool call to a tenant. It defaults to `default`, and the process refuses to start when the namespace does not exist, so a typo cannot silently write into `default`: `./yq-nova-mcp --db-path ./nova.db --namespace team-a`.
 
 ---
 
