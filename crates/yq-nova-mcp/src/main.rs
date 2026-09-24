@@ -21,7 +21,7 @@ use yq_nova_core::{
 };
 
 #[derive(Parser)]
-#[command(name = "yq-nova-mcp", version = "0.3.0")]
+#[command(name = "yq-nova-mcp", version)]
 struct Cli {
     #[arg(long, default_value = "./nova.db")]
     db_path: String,
@@ -136,10 +136,11 @@ async fn handle_request(
 ) -> HandlerResult {
     match req.method.as_str() {
         "initialize" => {
+            let server_version = env!("CARGO_PKG_VERSION");
             let result = serde_json::json!({
                 "protocolVersion": "2024-11-05",
                 "capabilities": { "tools": {} },
-                "serverInfo": { "name": "yq-nova-mcp", "version": "0.3.0" }
+                "serverInfo": { "name": "yq-nova-mcp", "version": server_version }
             });
             HandlerResult {
                 result: Some(result),
