@@ -60,16 +60,15 @@ pub fn vec_to_blob(v: &[f32]) -> Vec<u8> {
 }
 
 pub fn blob_to_vec(blob: &[u8]) -> NovaResult<Vec<f32>> {
-    if blob.len() % 4 != 0 {
+    if !blob.len().is_multiple_of(4) {
         return Err(NovaError::storage_msg(format!(
             "corrupt vector blob: length {} not multiple of 4",
             blob.len()
         )));
     }
     let mut out = Vec::with_capacity(blob.len() / 4);
-    for chunk in blob.chunks_exact(4) {
-        let arr: [u8; 4] = chunk.try_into().map_err(|_| NovaError::storage_msg("corrupt chunk"))?;
-        out.push(f32::from_le_bytes(arr));
+    for chunk in blob.as_chunks::<4>().0 {
+        out.push(f32::from_le_bytes(*chunk));
     }
     Ok(out)
 }
