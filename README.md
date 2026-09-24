@@ -3,11 +3,11 @@
   <img src="https://img.shields.io/badge/sqlite-3.x-blue?logo=sqlite" alt="SQLite">
   <img src="https://img.shields.io/badge/license-BSL--1.1-red" alt="License">
   <img src="https://img.shields.io/badge/status-beta-green" alt="Status">
-  <img src="https://github.com/YQteam-dyq/yq-nova-agent/actions/workflows/ci.yml/badge.svg" alt="CI">
+  <img src="https://github.com/YQteam-hq/yq-nova-agent/actions/workflows/ci.yml/badge.svg" alt="CI">
   <img src="https://img.shields.io/crates/v/yq-nova-core?logo=rust" alt="yq-nova-core">
   <img src="https://img.shields.io/crates/v/yq-nova-sdk?logo=rust" alt="yq-nova-sdk">
   <img src="https://img.shields.io/crates/v/yq-nova-server?logo=rust" alt="yq-nova-server">
-  <img src="https://img.shields.io/github/stars/YQteam-dyq/yq-nova-agent?style=social" alt="Stars">
+  <img src="https://img.shields.io/github/stars/YQteam-hq/yq-nova-agent?style=social" alt="Stars">
   <img src="https://img.shields.io/badge/PRs-welcome-brightgreen" alt="PRs Welcome">
 </p>
 
@@ -76,7 +76,7 @@ cargo add yq-nova-sdk     # HTTP client SDK
 ### From source
 
 ```bash
-git clone https://github.com/YQteam-dyq/yq-nova-agent.git
+git clone https://github.com/YQteam-hq/yq-nova-agent.git
 cd yq-nova-agent
 cargo build --release -p yq-nova-server --bin yq-nova
 ```
@@ -352,6 +352,8 @@ All settings via TOML file or `YQ_NOVA_*` environment variables:
 ```toml
 [server]
 bind = "127.0.0.1:7999"
+# Multi-tenant namespaces (#12): bind per-namespace API keys for tenant isolation.
+namespace_keys = { "team-a" = "${TEAM_A_NAMESPACE_KEY}" }
 
 [storage]
 db_path = "./nova.db"
@@ -379,10 +381,6 @@ dimensions = 1536
 # api_key = "${JINA_API_KEY}"
 # model = "jina-embeddings-v3"
 
-# Multi-tenant namespaces (#12): bind per-namespace API keys for tenant isolation.
-[server]
-namespace_keys = { "team-a" = "${TEAM_A_NAMESPACE_KEY}" }
-
 [graph]
 # Set graph.extract_llm to a chat provider name to enable LLM entity-relation extraction.
 extract_llm = "default"
@@ -400,6 +398,8 @@ All workflows live in [`.github/workflows`](.github/workflows) and run on GitHub
 
 - [`ci.yml`](.github/workflows/ci.yml) - formatting, Clippy, build and unit tests for the whole workspace.
 - [`english-only.yml`](.github/workflows/english-only.yml) - enforces the [English-only policy](CONTRIBUTING.md#language-policy-mandatory) on pull request titles, pull request descriptions and added diff lines.
+- [`pr-review.yml`](.github/workflows/pr-review.yml) - reviews every pull request and approves it when it finds no problem.
+- [`apply-rustfmt.yml`](.github/workflows/apply-rustfmt.yml) - manual run that applies nightly rustfmt and opens a pull request with the result.
 
 Run the same checks locally before opening a pull request:
 
@@ -443,7 +443,7 @@ Then add the following to the configuration file of **Claude Desktop** or anothe
 }
 ```
 
-The MCP server exposes six tools: `nova_remember`, `nova_recall`, `nova_forget`, `nova_memory_update`, `nova_stats` and `nova_traverse`. AI clients discover and call them automatically.
+The MCP server exposes eight tools: `nova_remember`, `nova_recall`, `nova_forget`, `nova_memory_update`, `nova_stats`, `nova_traverse`, `nova_list` and `nova_tags`. AI clients discover and call them automatically.
 
 ### OpenAI tool-calling schema example
 
