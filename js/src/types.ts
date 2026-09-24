@@ -326,6 +326,46 @@ export interface ExtractLinkInput {
   };
 }
 
+export interface NamespaceRecord {
+  id: number;
+  uuid: string;
+  name: string;
+  description: string | null;
+  config: JsonValue;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface NamespaceListParams {
+  limit?: number;
+  offset?: number;
+}
+
+export interface NamespaceListOutput {
+  total: number;
+  count: number;
+  limit: number;
+  offset: number;
+  items: NamespaceRecord[];
+}
+
+export interface CreateNamespaceInput {
+  name: string;
+  description?: string | null;
+  config?: JsonValue;
+}
+
+export interface UpdateNamespaceInput {
+  description?: string | null;
+  config?: JsonValue;
+}
+
+export interface DeleteNamespaceOutput {
+  name: string;
+  deleted: boolean;
+  protected: boolean;
+}
+
 export interface HealthOutput {
   status: string;
   version: string;

@@ -1,6 +1,8 @@
 import type {
   BatchRememberInput,
   BatchRememberOutput,
+  CreateNamespaceInput,
+  DeleteNamespaceOutput,
   EntityRecord,
   ExportInput,
   ExtractLinkInput,
@@ -19,6 +21,9 @@ import type {
   MergeInput,
   MergeOutput,
   MemoryRecord,
+  NamespaceListOutput,
+  NamespaceListParams,
+  NamespaceRecord,
   RecallInput,
   RecallOutput,
   RememberInput,
@@ -28,6 +33,7 @@ import type {
   TagListOutput,
   TraverseInput,
   UpdateMemoryInput,
+  UpdateNamespaceInput,
   UpsertEntityInput,
   UpsertEntityOutput,
   UpsertRelationInput,
@@ -38,6 +44,7 @@ export interface NovaClientOptions {
   apiKey?: string;
   timeoutMs?: number;
   fetch?: typeof fetch;
+  namespace?: string;
 }
 
 export class NovaApiError extends Error {
@@ -66,6 +73,7 @@ export class NovaClient {
   private readonly apiKey?: string;
   private readonly timeoutMs: number;
   private readonly fetchImpl: typeof fetch;
+  private namespaceValue?: string;
 
   constructor(baseUrl: string, options: NovaClientOptions = {}) {
     if (!baseUrl) {
@@ -75,9 +83,19 @@ export class NovaClient {
     this.apiKey = options.apiKey;
     this.timeoutMs = options.timeoutMs ?? 30000;
     this.fetchImpl = options.fetch ?? ((typeof globalThis !== "undefined" && globalThis.fetch) as typeof fetch);
+    this.namespaceValue = normalizeNamespace("namespace", options.namespace);
     if (!this.fetchImpl) {
       throw new Error("A fetch implementation is required; Node 18+ and browsers provide one globally");
     }
+  }
+
+  withNamespace(namespace: string): this {
+    this.namespaceValue = normalizeNamespace("withNamespace: namespace", namespace);
+    return this;
+  }
+
+  get namespace(): string | undefined {
+    return this.namespaceValue;
   }
 
   health() {
@@ -172,6 +190,44 @@ export class NovaClient {
     return this.request<Record<string, unknown>>("POST", "/v1/graph/extract-and-link", input);
   }
 
+  listNamespaces(params?: NamespaceListParams) {
+    return this.request<NamespaceListOutput>("GET", "/v1/namespaces", undefined, params);
+  }
+
+  getNamespace(name: string) {
+    const path = `/v1/namespaces/${this.quote(requireName("getNamespace", name))}`;
+    return this.request<NamespaceRecord>("GET", path);
+  }
+
+  createNamespace(input: CreateNamespaceInput) {
+    const name = requireName("createNamespace", input.name);
+    if (name.toLowerCase() === "default") {
+      throw new Error("createNamespace: 'default' is reserved");
+    }
+    return this.request<NamespaceRecord>("POST", "/v1/namespaces", {
+      name,
+      description: input.description ?? null,
+      config: input.config ?? {},
+    });
+  }
+
+  updateNamespace(name: string, input: UpdateNamespaceInput) {
+    const body: Record<string, unknown> = {};
+    if (input.description !== undefined) {
+      body.description = input.description;
+    }
+    if (input.config !== undefined) {
+      body.config = input.config;
+    }
+    const path = `/v1/namespaces/${this.quote(requireName("updateNamespace", name))}`;
+    return this.request<NamespaceRecord>("PATCH", path, body);
+  }
+
+  deleteNamespace(name: string) {
+    const path = `/v1/namespaces/${this.quote(requireName("deleteNamespace", name))}`;
+    return this.request<DeleteNamespaceOutput>("DELETE", path);
+  }
+
   private async request<T>(
     method: string,
     path: string,
@@ -189,6 +245,9 @@ export class NovaClient {
     }
     if (this.apiKey) {
       headers["Authorization"] = `Bearer ${this.apiKey}`;
+    }
+    if (this.namespaceValue) {
+      headers["x-namespace"] = this.namespaceValue;
     }
 
     const controller = "AbortController" in globalThis ? new AbortController() : undefined;
@@ -267,4 +326,23 @@ export class NovaClient {
 function bodySnippet(text: string): string {
   const s = text.replace(/\s+/g, " ").trim();
   return s.length > 160 ? `${s.slice(0, 160)}...` : s;
+}
+
+function normalizeNamespace(label: string, namespace: string | undefined): string | undefined {
+  if (namespace === undefined) {
+    return undefined;
+  }
+  const trimmed = namespace.trim();
+  if (!trimmed) {
+    throw new Error(`${label} must be non-empty when provided`);
+  }
+  return trimmed;
+}
+
+function requireName(label: string, name: string): string {
+  const trimmed = typeof name === "string" ? name.trim() : "";
+  if (!trimmed) {
+    throw new Error(`${label}: name must be non-empty`);
+  }
+  return trimmed;
 }
