@@ -79,12 +79,42 @@ client.extract_and_link(
 )
 ```
 
+## Multi-tenant namespaces
+
+Since 0.4.0 every memory, tag, entity and relation is scoped to a namespace, and
+the server falls back to the `default` namespace when the `x-namespace` header is
+absent. Pass a namespace to target a tenant:
+
+```python
+client = Client("http://127.0.0.1:7999", api_key="<tenant-key>", namespace="team-a")
+
+# Every request from this client now carries `x-namespace: team-a`.
+client.remember("tenant scoped memory")
+
+# Point the same client at another tenant.
+client.with_namespace("team-b")
+```
+
+Namespace administration needs an admin client (the global `auth_token`):
+
+```python
+client.list_namespaces(limit=100)
+client.get_namespace("team-a")
+client.create_namespace("team-c", description="third tenant")
+client.update_namespace("team-c", description="renamed")
+client.delete_namespace("team-c")
+```
+
+A namespace must be non-empty when provided, and `default` is reserved.
+
 The client covers every v1 endpoint: `health`, `stats`, `remember`,
 `remember_batch`, `recall`, `list_memories`, `forget`, `get_memory`,
 `update_memory`, `delete_memory`, `export_memories`, `import_memories`,
 `merge_memories`, `list_tags`, `rename_tag`, `delete_tag`, `upsert_entity`,
 `list_entities`, `merge_entities`, `upsert_relation`, `list_relations`,
-`traverse` and `extract_and_link`. A runnable walkthrough of all of them is in
+`traverse`, `extract_and_link`, `list_namespaces`, `get_namespace`,
+`create_namespace`, `update_namespace` and `delete_namespace`. A runnable
+walkthrough of all of them is in
 [`examples/full_api_demo.py`](examples/full_api_demo.py).
 
 ## Errors
@@ -105,5 +135,10 @@ except NovaApiError as e:
 
 ```bash
 python3 -m py_compile yq_nova/client.py yq_nova/__init__.py   # syntax check
-python3 -m pytest tests/ -q                                   # optional smoke test
+python3 tests/test_client_smoke.py                            # smoke test
+python3 tests/test_namespace.py                               # namespace round trip
 ```
+
+`tests/test_namespace.py` starts a throwaway HTTP server on a loopback port and
+asserts the headers the client actually sends, so it needs no running `yq_nova`
+instance. `python3 -m pytest tests/ -q` also works.
