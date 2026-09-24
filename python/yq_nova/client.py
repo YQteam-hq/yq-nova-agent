@@ -32,6 +32,7 @@ class Client:
         base_url: str,
         api_key: Optional[str] = None,
         timeout: float = 30.0,
+        namespace: Optional[str] = None,
     ) -> None:
         base = base_url.rstrip("/")
         if not base:
@@ -39,6 +40,12 @@ class Client:
         self.base_url = base
         self.api_key = api_key
         self.timeout = timeout
+        self.namespace = _validated_namespace("namespace", namespace)
+
+    def with_namespace(self, namespace: str) -> "Client":
+
+        self.namespace = _validated_namespace("with_namespace: namespace", namespace)
+        return self
 
     def _request(
         self,
@@ -58,6 +65,8 @@ class Client:
         }
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
+        if self.namespace:
+            headers["x-namespace"] = self.namespace
 
         data = None
         if body is not None:
@@ -456,6 +465,71 @@ class Client:
             merged.update(opts)
         body = {"text": text, "opts": merged}
         return self._request("POST", "/v1/graph/extract-and-link", body)
+
+    def list_namespaces(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> Dict[str, Any]:
+
+        if limit < 1:
+            raise ValueError("list_namespaces: limit must be >= 1")
+        return self._request("GET", "/v1/namespaces", params={"limit": limit, "offset": offset})
+
+    def get_namespace(self, name: str) -> Dict[str, Any]:
+
+        return self._request("GET", f"/v1/namespaces/{_quote(_validated_namespace_name(name, 'get_namespace'))}")
+
+    def create_namespace(
+        self,
+        name: str,
+        description: Optional[str] = None,
+        config: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+
+        name = _validated_namespace_name(name, "create_namespace")
+        if name.lower() == "default":
+            raise ValueError("create_namespace: 'default' is reserved")
+        body: Dict[str, Any] = {
+            "name": name,
+            "description": description,
+            "config": config if config is not None else {},
+        }
+        return self._request("POST", "/v1/namespaces", body)
+
+    def update_namespace(
+        self,
+        name: str,
+        description: Optional[str] = None,
+        config: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+
+        name = _validated_namespace_name(name, "update_namespace")
+        body: Dict[str, Any] = {}
+        if description is not None:
+            body["description"] = description
+        if config is not None:
+            body["config"] = config
+        return self._request("PATCH", f"/v1/namespaces/{_quote(name)}", body)
+
+    def delete_namespace(self, name: str) -> Dict[str, Any]:
+
+        name = _validated_namespace_name(name, "delete_namespace")
+        return self._request("DELETE", f"/v1/namespaces/{_quote(name)}")
+
+def _validated_namespace(label: str, value: Optional[str]) -> Optional[str]:
+
+    if value is None:
+        return None
+    if not value.strip():
+        raise ValueError(f"{label} must be non-empty when provided")
+    return value.strip()
+
+def _validated_namespace_name(value: str, label: str) -> str:
+
+    if not value or not value.strip():
+        raise ValueError(f"{label}: name must be non-empty")
+    return value.strip()
 
 def _quote(value: str) -> str:
 
