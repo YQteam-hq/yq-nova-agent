@@ -1,0 +1,79 @@
+name: "Bot: Auto Labeler"
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+  issues:
+    types: [opened, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  auto-label:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Apply labels
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+
+            const RULES = [
+              { label: "documentation", color: "0075ca", patterns: [/(^|\/)docs?\//i, /\.mdx?$/i, /readme/i] },
+              { label: "ci",            color: "1d76db", patterns: [/^\.github\//i, /(^|\/)\.ci\//i, /(^|\/)(Dockerfile|Makefile)/i] },
+              { label: "dependencies",  color: "0366d6", patterns: [/(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|Cargo\.lock|go\.sum|composer\.lock|Gemfile\.lock)$/i, /(^|\/)package\.json$/i, /(^|\/)requirements\.txt$/i] },
+              { label: "tests",         color: "fbca04", patterns: [/(^|\/)(test|tests|spec|specs|__tests__)\//i, /\.(test|spec)\./i] },
+              { label: "frontend",      color: "c5def5", patterns: [/\.(js|jsx|ts|tsx|vue|svelte|css|scss|sass|less|html)$/i] },
+              { label: "backend",       color: "bfd4f2", patterns: [/\.(py|go|rs|java|kt|rb|php|c|cc|cpp|h|hpp|cs|swift)$/i] },
+            ];
+
+            async function ensureLabel(name, color) {
+              try {
+                await github.rest.issues.getLabel({ owner, repo, name });
+              } catch (e) {
+                if (e.status === 404) {
+                  try {
+                    await github.rest.issues.createLabel({ owner, repo, name, color, description: "Auto-applied by Auto Labeler bot" });
+                    core.info(`Created label: ${name}`);
+                  } catch (e2) {
+                    core.warning(`Could not create label ${name}: ${e2.message}`);
+                  }
+                }
+              }
+            }
+
+            // New / reopened issues -> triage label
+            if (context.eventName === "issues") {
+              const issue = context.payload.issue;
+              if (issue.labels && issue.labels.length > 0) {
+                core.info("Issue already has labels; skipping.");
+                return;
+              }
+              await ensureLabel("needs-triage", "ededed");
+              await github.rest.issues.addLabels({ owner, repo, issue_number: issue.number, labels: ["needs-triage"] });
+              core.info("Applied label: needs-triage");
+              return;
+            }
+
+            // Pull requests -> label by changed file paths
+            const prNumber = context.payload.pull_request.number;
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner, repo, pull_number: prNumber, per_page: 100,
+            });
+            const names = files.map((f) => f.filename);
+            const matched = RULES.filter((rule) => names.some((n) => rule.patterns.some((p) => p.test(n))));
+
+            if (matched.length === 0) {
+              core.info("No label rules matched.");
+              return;
+            }
+            for (const rule of matched) {
+              await ensureLabel(rule.label, rule.color);
+            }
+            await github.rest.issues.addLabels({
+              owner, repo, issue_number: prNumber, labels: matched.map((r) => r.label),
+            });
+            core.info(`Applied labels: ${matched.map((r) => r.label).join(", ")}`);
