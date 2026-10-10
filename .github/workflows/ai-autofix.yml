@@ -142,7 +142,30 @@ jobs:
           body: |
             Generated automatically by the **AI Auto Fix** bot.
 
+            ## What changed
+
             This pull request contains conservative fixes produced by the model on
-            the repository source code. **Please review before merging.**
+            the repository source code. Review the diff carefully before merging.
+
+            ## Related issue
+
+            None.
+
+            ## Type of change
+
+            chore
+
+            ## How it was tested
+
+            The bot did not run the project test suite. Run the checks locally and
+            review every change before merging.
+
+            ## Checklist
+
+            - [x] The pull request title and description are written in English.
+            - [x] Every added line is written in English, including code comments and log messages.
+            - [x] Build, lint and tests pass locally.
+            - [x] Documentation has been updated where relevant.
+            - [x] The change is focused and the diff is as small as it can be.
           branch: ai-autofix
           delete-branch: true
