@@ -1,0 +1,148 @@
+name: "Bot: AI Auto Fix PR"
+
+# Lets GLM-4.5-Flash look for obvious bugs in a few source files and opens a
+# pull request with conservative fixes for a human to review.
+# Every literal in this file stays English so the repository language policy is
+# satisfied; the model is asked to keep code comments in English as well.
+#
+# Requirement: set a repository (or organization) secret named GLM_API_KEY.
+# Without the secret the job exits successfully without changes.
+
+on:
+  schedule:
+    - cron: "0 2 * * 1"
+  workflow_dispatch:
+    inputs:
+      max_files:
+        description: "Maximum number of files to inspect in this run"
+        required: false
+        default: "3"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  autofix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run AI fixer
+        env:
+          GLM_API_KEY: ${{ secrets.GLM_API_KEY }}
+          GLM_MODEL: glm-4.5-flash
+          MAX_FILES: ${{ github.event.inputs.max_files || '3' }}
+        run: |
+          python3 - <<'PY'
+          import os, json, subprocess, urllib.request, pathlib, sys
+
+          KEY = (os.environ.get("GLM_API_KEY") or "").strip()
+          MODEL = os.environ.get("GLM_MODEL", "glm-4.5-flash")
+          ENDPOINT = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+          MAX_FILES = int(os.environ.get("MAX_FILES", "3") or "3")
+          MAX_BYTES = 16000
+
+          if not KEY:
+              print("GLM_API_KEY not set; nothing to do.")
+              sys.exit(0)
+
+          EXTS = {".py",".js",".jsx",".ts",".tsx",".go",".rs",".java",".rb",".php",".c",".h",
+                  ".cc",".cpp",".hpp",".cs",".kt",".swift",".sh",".css",".scss",".html",".vue",".svelte"}
+          SKIP = {"package-lock.json","yarn.lock","pnpm-lock.yaml","Cargo.lock","go.sum","composer.lock"}
+          SKIP_DIRS = {"node_modules","dist","build","vendor",".git","target","out"}
+
+          files = subprocess.check_output(["git", "ls-files"], text=True).splitlines()
+          cands = []
+          for f in files:
+              p = pathlib.Path(f)
+              if not p.is_file():
+                  continue
+              if p.suffix.lower() not in EXTS:
+                  continue
+              if p.name in SKIP:
+                  continue
+              if f.startswith(".github/"):
+                  continue
+              if any(part in SKIP_DIRS for part in p.parts):
+                  continue
+              try:
+                  if p.stat().st_size > MAX_BYTES:
+                      continue
+                  text = p.read_text(encoding="utf-8")
+              except Exception:
+                  continue
+              cands.append((f, text))
+
+          if not cands:
+              print("No candidate files.")
+              sys.exit(0)
+
+          def call(messages):
+              req = urllib.request.Request(
+                  ENDPOINT,
+                  data=json.dumps({"model": MODEL, "messages": messages,
+                                   "temperature": 0.2, "max_tokens": 4000}).encode(),
+                  headers={"Content-Type": "application/json", "Authorization": "Bearer " + KEY},
+              )
+              with urllib.request.urlopen(req, timeout=120) as r:
+                  data = json.loads(r.read().decode())
+              return data["choices"][0]["message"]["content"]
+
+          changed = []
+          for f, text in cands[:MAX_FILES]:
+              prompt = (
+                  "You are a careful code fixing assistant. Below is one source file. "
+                  "Fix only clear defects (bugs, obvious boundary or null problems, security issues). "
+                  "Keep all code comments and strings in English. "
+                  "If no change is needed, reply with exactly NO_CHANGES. "
+                  "If a change is needed, output only the full modified file content, "
+                  "with no explanation and no Markdown code fences.\n\n"
+                  f"File: {f}\n\n-----BEGIN FILE-----\n{text}\n-----END FILE-----"
+              )
+              try:
+                  out = call([{"role": "user", "content": prompt}]).strip()
+              except Exception as e:
+                  print(f"[skip] {f}: {e}")
+                  continue
+
+              if not out or out == "NO_CHANGES":
+                  print(f"[ok] {f}: no changes")
+                  continue
+
+              if out.startswith("```"):
+                  lines = out.splitlines()
+                  if lines and lines[0].startswith("```"):
+                      lines = lines[1:]
+                  if lines and lines[-1].strip() == "```":
+                      lines = lines[:-1]
+                  out = "\n".join(lines) + "\n"
+
+              if out.strip() == text.strip():
+                  print(f"[ok] {f}: identical")
+                  continue
+
+              pathlib.Path(f).write_text(out, encoding="utf-8")
+              changed.append(f)
+              print(f"[fixed] {f}")
+
+          if not changed:
+              print("No files changed.")
+              sys.exit(0)
+          print("Changed files: " + ", ".join(changed))
+          PY
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v6
+        with:
+          commit-message: "chore: AI autofix (GLM-4.5-Flash)"
+          title: "AI autofix suggestions"
+          body: |
+            Generated automatically by the **AI Auto Fix** bot.
+
+            This pull request contains conservative fixes produced by the model on
+            the repository source code. **Please review before merging.**
+          branch: ai-autofix
+          delete-branch: true
