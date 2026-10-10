@@ -1,0 +1,116 @@
+name: "Bot: AI PR Review"
+
+# Reviews a pull request with GLM-4.5-Flash and posts the review as a comment.
+# The model writes its review in Simplified Chinese, while every literal in this
+# file stays English so the repository language policy is satisfied.
+#
+# Requirement: set a repository (or organization) secret named GLM_API_KEY.
+# Without the secret the job logs a warning and exits successfully.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: ai-pr-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    name: review
+    if: ${{ github.event.pull_request.draft == false }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: AI review with GLM
+        uses: actions/github-script@v7
+        env:
+          GLM_API_KEY: ${{ secrets.GLM_API_KEY }}
+          GLM_MODEL: glm-4.5-flash
+          GLM_ENDPOINT: https://open.bigmodel.cn/api/paas/v4/chat/completions
+          MAX_CHARS: "14000"
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const pr = context.payload.pull_request;
+            const key = process.env.GLM_API_KEY;
+            if (!key) {
+              core.warning("GLM_API_KEY secret is not set. Skipping AI review.");
+              return;
+            }
+
+            const skipRe = /(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|Cargo\.lock|go\.sum|composer\.lock|\.min\.(js|css)$|\.(png|jpg|jpeg|gif|svg|ico|pdf|zip|gz|woff2?|ttf|lock)$)/i;
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner, repo, pull_number: pr.number, per_page: 100,
+            });
+
+            let budget = Number(process.env.MAX_CHARS);
+            let diffText = "";
+            for (const f of files) {
+              if (!f.patch) continue;
+              if (skipRe.test(f.filename)) continue;
+              const chunk = `### ${f.filename} (${f.status}, +${f.additions}/-${f.deletions})\n\`\`\`diff\n${f.patch}\n\`\`\`\n`;
+              if (chunk.length > budget) { diffText += "\n_(some files skipped: too large)_\n"; break; }
+              diffText += chunk;
+              budget -= chunk.length;
+            }
+
+            if (!diffText.trim()) {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: pr.number,
+                body: "## AI code review\n\nThis pull request has no reviewable text changes. Skipped.",
+              });
+              return;
+            }
+
+            const system = [
+              "You are a senior code reviewer.",
+              "Review this Pull Request and write the final review in Simplified Chinese.",
+              "Focus on: 1) correctness and potential bugs; 2) edge cases and error handling;",
+              "3) security and performance; 4) readability and maintainability.",
+              "Give concrete, actionable suggestions and reference file names and key code.",
+              "Mark severe problems with the tag [Severe].",
+              "End with an overall verdict: safe to merge, or fix before merging.",
+              "Use Markdown and do not repeat the full diff.",
+            ].join("\n");
+            const user = `Repo: ${owner}/${repo}\nPR title: ${pr.title}\nPR body: ${(pr.body || "").slice(0, 2000)}\n\nChanges:\n\n${diffText}`;
+
+            async function callGLM() {
+              const res = await fetch(process.env.GLM_ENDPOINT, {
+                method: "POST",
+                headers: { "Content-Type": "application/json", "Authorization": `Bearer ${key}` },
+                body: JSON.stringify({
+                  model: process.env.GLM_MODEL || "glm-4.5-flash",
+                  messages: [
+                    { role: "system", content: system },
+                    { role: "user", content: user },
+                  ],
+                  temperature: 0.3,
+                  max_tokens: 2000,
+                }),
+              });
+              if (!res.ok) {
+                const body = await res.text();
+                throw new Error(`GLM API ${res.status}: ${body.slice(0, 500)}`);
+              }
+              const data = await res.json();
+              return (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || "";
+            }
+
+            let review = "";
+            try {
+              review = await callGLM();
+            } catch (e) {
+              core.warning("AI review failed: " + e.message);
+              return;
+            }
+            if (!review.trim()) {
+              core.warning("Empty AI response.");
+              return;
+            }
+
+            const body = `## AI code review (GLM-4.5-Flash)\n\n${review}\n\n---\n<sub>Generated automatically by the AI PR Review bot. For reference only.</sub>`;
+            await github.rest.issues.createComment({ owner, repo, issue_number: pr.number, body });
