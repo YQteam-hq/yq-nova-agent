@@ -1,7 +1,7 @@
 name: "Bot: AI PR Review"
 
 # Reviews a pull request with an AI model and posts the review as a comment.
-# The comment shows an English version first, then a Chinese version.
+# The comment is written in English and ends with the bot signature line.
 # Every literal in this file stays English so the repository language policy
 # is satisfied.
 #
@@ -39,7 +39,6 @@ jobs:
             const pr = context.payload.pull_request;
             const key = process.env.GLM_API_KEY;
             const MARKER = "<!-- ai-pr-review-bot -->";
-            const CN_MARK = "<<<CN>>>";
             if (!key) {
               core.warning("Review secret is not set. Skipping AI review.");
               return;
@@ -88,11 +87,7 @@ jobs:
               "End with an overall verdict: safe to merge, or fix before merging.",
               "Use Markdown and do not repeat the full diff.",
               "Never mention the name of the model or the vendor that produced this review.",
-              "",
-              "Output format, follow it strictly:",
-              "1) First write the complete review in English.",
-              "2) Then output one single line containing exactly this marker: " + CN_MARK,
-              "3) Then write the same review in Simplified Chinese.",
+              "Write the review in English.",
             ].join("\n");
             const user = `Repo: ${owner}/${repo}\nPR title: ${pr.title}\nPR body: ${(pr.body || "").slice(0, 2000)}\n\nChanges:\n\n${diffText}`;
 
@@ -130,13 +125,8 @@ jobs:
               return;
             }
 
-            const idx = review.indexOf(CN_MARK);
-            const en = (idx >= 0 ? review.slice(0, idx) : review).trim();
-            const cn = (idx >= 0 ? review.slice(idx + CN_MARK.length) : "").trim();
             const DASH = "\u2014\u2014";
 
-            let body = "## AI Code Review\n\n" + en + "\n";
-            if (cn) body += "\n" + DASH + "\n\n" + cn + "\n";
-            body += "\n---\n<sub>Automated review. For reference only.</sub>\n\n" + MARKER;
+            const body = "## AI Code Review\n\n" + review.trim() + "\n\n" + DASH + "YQTEAM BOT\n\n" + MARKER;
 
             await upsert(body);
