@@ -1,6 +1,6 @@
 name: "Bot: AI Auto Fix PR"
 
-# Lets GLM-4.5-Flash look for obvious bugs in a few source files and opens a
+# Lets an AI model look for obvious bugs in a few source files and opens a
 # pull request with conservative fixes for a human to review.
 # Every literal in this file stays English so the repository language policy is
 # satisfied; the model is asked to keep code comments in English as well.
@@ -137,7 +137,7 @@ jobs:
       - name: Create Pull Request
         uses: peter-evans/create-pull-request@v6
         with:
-          commit-message: "chore: AI autofix (GLM-4.5-Flash)"
+          commit-message: "chore: AI autofix"
           title: "AI autofix suggestions"
           body: |
             Generated automatically by the **AI Auto Fix** bot.
