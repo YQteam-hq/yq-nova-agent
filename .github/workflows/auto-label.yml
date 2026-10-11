@@ -1,5 +1,14 @@
 name: "Bot: Auto Labeler"
 
+# Labels pull requests across several dimensions: change type (from a
+# Conventional Commits style title), size, language and touched area, plus a
+# few category labels. Labels are additive; existing labels are never removed.
+# Every literal in this file stays English.
+#
+# Optional: set the organization variable BOT_APP_ID and the organization
+# secret BOT_APP_PRIVATE_KEY for a GitHub App to publish under the bot's own
+# name. When they are absent the workflow falls back to the default token.
+
 on:
   pull_request:
     types: [opened, reopened, synchronize, ready_for_review]
@@ -15,20 +24,66 @@ jobs:
   auto-label:
     runs-on: ubuntu-latest
     steps:
+      - name: Mint bot token
+        id: bot
+        if: ${{ vars.BOT_APP_ID != '' }}
+        continue-on-error: true
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.BOT_APP_ID }}
+          private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
+
       - name: Apply labels
         uses: actions/github-script@v7
         with:
+          github-token: ${{ steps.bot.outputs.token || github.token }}
           script: |
             const { owner, repo } = context.repo;
 
-            const RULES = [
-              { label: "documentation", color: "0075ca", patterns: [/(^|\/)docs?\//i, /\.mdx?$/i, /readme/i] },
-              { label: "ci",            color: "1d76db", patterns: [/^\.github\//i, /(^|\/)\.ci\//i, /(^|\/)(Dockerfile|Makefile)/i] },
-              { label: "dependencies",  color: "0366d6", patterns: [/(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|Cargo\.lock|go\.sum|composer\.lock|Gemfile\.lock)$/i, /(^|\/)package\.json$/i, /(^|\/)requirements\.txt$/i] },
-              { label: "tests",         color: "fbca04", patterns: [/(^|\/)(test|tests|spec|specs|__tests__)\//i, /\.(test|spec)\./i] },
+            // Category labels derived from changed file paths.
+            const FILE_RULES = [
+              { label: "documentation", color: "0075ca", patterns: [/(^|\/)docs?\//i, /\.(md|mdx|rst|adoc)$/i, /(^|\/)readme/i] },
+              { label: "ci",            color: "1d76db", patterns: [/^\.github\//i, /(^|\/)\.ci\//i, /(^|\/)(dockerfile|makefile|cmakelists\.txt)$/i] },
+              { label: "dependencies",  color: "0366d6", patterns: [/(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|cargo\.lock|go\.sum|composer\.lock|gemfile\.lock)$/i, /(^|\/)(package\.json|requirements\.txt|pyproject\.toml|cargo\.toml|go\.mod)$/i] },
+              { label: "tests",         color: "fbca04", patterns: [/(^|\/)(test|tests|spec|specs|__tests__)\//i, /\.(test|spec)\./i, /(^|\/)test_[^/]*$/i, /_test\.[a-z]+$/i] },
               { label: "frontend",      color: "c5def5", patterns: [/\.(js|jsx|ts|tsx|vue|svelte|css|scss|sass|less|html)$/i] },
-              { label: "backend",       color: "bfd4f2", patterns: [/\.(py|go|rs|java|kt|rb|php|c|cc|cpp|h|hpp|cs|swift)$/i] },
             ];
+
+            // Language labels derived from file extensions.
+            const LANG_RULES = [
+              { label: "lang: C",          color: "555555", exts: [".c", ".h"] },
+              { label: "lang: C++",        color: "f34b7d", exts: [".cc", ".cpp", ".cxx", ".hpp", ".hxx"] },
+              { label: "lang: Rust",       color: "dea584", exts: [".rs"] },
+              { label: "lang: Python",     color: "3572a5", exts: [".py"] },
+              { label: "lang: Go",         color: "00add8", exts: [".go"] },
+              { label: "lang: JavaScript", color: "f1e05a", exts: [".js", ".jsx", ".mjs", ".cjs"] },
+              { label: "lang: TypeScript", color: "3178c6", exts: [".ts", ".tsx"] },
+              { label: "lang: Java",       color: "b07219", exts: [".java"] },
+              { label: "lang: Shell",      color: "89e051", exts: [".sh", ".bash"] },
+            ];
+
+            // Change type derived from a Conventional Commits style title.
+            const TYPE_RULES = [
+              { re: /^feat(\b|\(|:|!)/i,     label: "type: feature",     color: "0e8a16" },
+              { re: /^fix(\b|\(|:|!)/i,      label: "type: fix",         color: "d73a4a" },
+              { re: /^perf(\b|\(|:|!)/i,     label: "type: performance", color: "fbca04" },
+              { re: /^refactor(\b|\(|:|!)/i, label: "type: refactor",    color: "1d76db" },
+              { re: /^docs?(\b|\(|:|!)/i,    label: "type: docs",        color: "0075ca" },
+              { re: /^tests?(\b|\(|:|!)/i,   label: "type: test",        color: "c2e0c6" },
+              { re: /^ci(\b|\(|:|!)/i,       label: "type: ci",          color: "5319e7" },
+              { re: /^build(\b|\(|:|!)/i,    label: "type: build",       color: "bfd4f2" },
+              { re: /^chore(\b|\(|:|!)/i,    label: "type: chore",       color: "ededed" },
+              { re: /^style(\b|\(|:|!)/i,    label: "type: style",       color: "fef2c0" },
+              { re: /^revert(\b|\(|:|!)/i,   label: "type: revert",      color: "e4e669" },
+            ];
+
+            function sizeRule(total) {
+              if (total <= 10)   return { label: "size: XS", color: "3cbf00" };
+              if (total <= 50)   return { label: "size: S",  color: "5d9801" };
+              if (total <= 250)  return { label: "size: M",  color: "f9d900" };
+              if (total <= 1000) return { label: "size: L",  color: "ff8000" };
+              return { label: "size: XL", color: "e11d21" };
+            }
 
             async function ensureLabel(name, color) {
               try {
@@ -58,22 +113,42 @@ jobs:
               return;
             }
 
-            // Pull requests -> label by changed file paths
-            const prNumber = context.payload.pull_request.number;
+            // Pull requests -> label by title, size, language and touched area
+            const pr = context.payload.pull_request;
             const files = await github.paginate(github.rest.pulls.listFiles, {
-              owner, repo, pull_number: prNumber, per_page: 100,
+              owner, repo, pull_number: pr.number, per_page: 100,
             });
             const names = files.map((f) => f.filename);
-            const matched = RULES.filter((rule) => names.some((n) => rule.patterns.some((p) => p.test(n))));
+            const changed = files.reduce((sum, f) => sum + (f.additions || 0) + (f.deletions || 0), 0);
 
-            if (matched.length === 0) {
+            const picked = new Map();
+            const add = (label, color) => picked.set(label, color);
+
+            for (const rule of FILE_RULES) {
+              if (names.some((n) => rule.patterns.some((p) => p.test(n)))) add(rule.label, rule.color);
+            }
+            for (const rule of LANG_RULES) {
+              if (names.some((n) => rule.exts.some((e) => n.toLowerCase().endsWith(e)))) add(rule.label, rule.color);
+            }
+            for (const rule of TYPE_RULES) {
+              if (rule.re.test(pr.title || "")) add(rule.label, rule.color);
+            }
+            add(sizeRule(changed).label, sizeRule(changed).color);
+
+            const AREA_SKIP = new Set([".github", "docs", "doc", "test", "tests", "spec", "specs"]);
+            for (const n of names) {
+              const seg = n.split("/");
+              if (seg.length > 1 && seg[0] && !seg[0].startsWith(".") && !AREA_SKIP.has(seg[0].toLowerCase())) {
+                add("area: " + seg[0], "d4c5f9");
+              }
+            }
+
+            if (picked.size === 0) {
               core.info("No label rules matched.");
               return;
             }
-            for (const rule of matched) {
-              await ensureLabel(rule.label, rule.color);
-            }
+            for (const [name, color] of picked) await ensureLabel(name, color);
             await github.rest.issues.addLabels({
-              owner, repo, issue_number: prNumber, labels: matched.map((r) => r.label),
+              owner, repo, issue_number: pr.number, labels: [...picked.keys()],
             });
-            core.info(`Applied labels: ${matched.map((r) => r.label).join(", ")}`);
+            core.info("Applied labels: " + [...picked.keys()].join(", "));
