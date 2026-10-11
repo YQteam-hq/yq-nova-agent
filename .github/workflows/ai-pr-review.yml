@@ -1,12 +1,18 @@
 name: "Bot: AI PR Review"
 
-# Reviews a pull request with an AI model and posts the review as a comment.
-# The comment is written in English and ends with the bot signature line.
+# Reviews a pull request with an AI model, posts a summary comment and
+# submits a pull request review so the bot can also act as an approver.
 # Every literal in this file stays English so the repository language policy
 # is satisfied.
 #
 # Requirement: set a repository (or organization) secret named GLM_API_KEY.
 # Without the secret the job logs a warning and exits successfully.
+#
+# Optional: to publish under the bot's own name (instead of the generic
+# github-actions identity) set the organization variable BOT_APP_ID and the
+# organization secret BOT_APP_PRIVATE_KEY for a GitHub App installed on the
+# repositories. When they are absent the workflow falls back to the default
+# GITHUB_TOKEN.
 
 on:
   pull_request:
@@ -15,10 +21,11 @@ on:
 permissions:
   contents: read
   pull-requests: write
+  issues: write
 
 concurrency:
   group: ai-pr-review-${{ github.event.pull_request.number }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   review:
@@ -26,6 +33,15 @@ jobs:
     if: ${{ github.event.pull_request.draft == false }}
     runs-on: ubuntu-latest
     steps:
+      - name: Mint bot token
+        id: bot
+        if: ${{ vars.BOT_APP_ID != '' }}
+        continue-on-error: true
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.BOT_APP_ID }}
+          private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
+
       - name: AI review
         uses: actions/github-script@v7
         env:
@@ -33,15 +49,21 @@ jobs:
           GLM_MODEL: glm-4.5-flash
           GLM_ENDPOINT: https://open.bigmodel.cn/api/paas/v4/chat/completions
           MAX_CHARS: "14000"
+          ATTEMPTS: "4"
         with:
+          github-token: ${{ steps.bot.outputs.token || github.token }}
           script: |
             const { owner, repo } = context.repo;
             const pr = context.payload.pull_request;
             const key = process.env.GLM_API_KEY;
             const MARKER = "<!-- ai-pr-review-bot -->";
-            if (!key) {
-              core.warning("Review secret is not set. Skipping AI review.");
-              return;
+            const DASH = "\u2014\u2014";
+            const shot = (pr.head && pr.head.sha ? pr.head.sha : "").slice(0, 7);
+
+            function footer() {
+              let s = "\n\n" + DASH + "YQTEAM BOT";
+              if (shot) s += " | reviewed commit " + shot;
+              return s + "\n\n" + MARKER;
             }
 
             async function upsert(body) {
@@ -54,6 +76,11 @@ jobs:
               } else {
                 await github.rest.issues.createComment({ owner, repo, issue_number: pr.number, body });
               }
+            }
+
+            if (!key) {
+              core.warning("Review secret is not set. Skipping AI review.");
+              return;
             }
 
             const skipRe = /(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|Cargo\.lock|go\.sum|composer\.lock|\.min\.(js|css)$|\.(png|jpg|jpeg|gif|svg|ico|pdf|zip|gz|woff2?|ttf|lock)$)/i;
@@ -73,7 +100,7 @@ jobs:
             }
 
             if (!diffText.trim()) {
-              await upsert("## AI Code Review\n\nThis pull request has no reviewable text changes. Skipped.\n\n" + MARKER);
+              await upsert("## AI Code Review\n\nThis pull request has no reviewable text changes. Skipped." + footer());
               return;
             }
 
@@ -91,42 +118,70 @@ jobs:
             ].join("\n");
             const user = `Repo: ${owner}/${repo}\nPR title: ${pr.title}\nPR body: ${(pr.body || "").slice(0, 2000)}\n\nChanges:\n\n${diffText}`;
 
+            function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
             async function callModel() {
-              const res = await fetch(process.env.GLM_ENDPOINT, {
-                method: "POST",
-                headers: { "Content-Type": "application/json", "Authorization": `Bearer ${key}` },
-                body: JSON.stringify({
-                  model: process.env.GLM_MODEL || "glm-4.5-flash",
-                  messages: [
-                    { role: "system", content: system },
-                    { role: "user", content: user },
-                  ],
-                  temperature: 0.3,
-                  max_tokens: 3000,
-                }),
-              });
-              if (!res.ok) {
-                const detail = await res.text();
-                throw new Error(`API ${res.status}: ${detail.slice(0, 500)}`);
+              const attempts = Number(process.env.ATTEMPTS) || 4;
+              let lastErr;
+              for (let i = 0; i < attempts; i++) {
+                if (i > 0) await sleep(2000 * Math.pow(2, i - 1));
+                try {
+                  const res = await fetch(process.env.GLM_ENDPOINT, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json", "Authorization": `Bearer ${key}` },
+                    body: JSON.stringify({
+                      model: process.env.GLM_MODEL || "glm-4.5-flash",
+                      messages: [
+                        { role: "system", content: system },
+                        { role: "user", content: user },
+                      ],
+                      temperature: 0.3,
+                      max_tokens: 3000,
+                    }),
+                  });
+                  if (!res.ok) {
+                    const detail = await res.text();
+                    throw new Error(`API ${res.status}: ${detail.slice(0, 300)}`);
+                  }
+                  const data = await res.json();
+                  const txt = (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || "";
+                  if (!txt.trim()) throw new Error("empty response");
+                  return txt;
+                } catch (e) {
+                  lastErr = e;
+                  core.warning(`AI review attempt ${i + 1}/${attempts} failed: ${e.message}`);
+                }
               }
-              const data = await res.json();
-              return (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || "";
+              throw lastErr;
             }
 
             let review = "";
             try {
               review = await callModel();
             } catch (e) {
-              core.warning("AI review failed: " + e.message);
+              core.warning("AI review failed after retries: " + e.message);
+              await upsert(
+                "## AI Code Review\n\n" +
+                "The automated review could not be completed after several attempts.\n\n" +
+                "> " + String(e.message).replace(/\s+/g, " ").slice(0, 300) + "\n\n" +
+                "Push a new commit or re-run the workflow to try again." +
+                footer()
+              );
               return;
             }
-            if (!review.trim()) {
-              core.warning("Empty AI response.");
-              return;
+
+            await upsert("## AI Code Review\n\n" + review.trim() + footer());
+
+            const severe = /\[severe\]/i.test(review);
+            const event = severe ? "COMMENT" : "APPROVE";
+            const note = severe
+              ? "Automated review found issues for commit " + shot + ". See the review comment for details."
+              : "Automated review passed for commit " + shot + ". No blocking issues found.";
+            try {
+              await github.rest.pulls.createReview({
+                owner, repo, pull_number: pr.number, event, body: note,
+              });
+              core.info("Submitted pull request review: " + event);
+            } catch (e) {
+              core.warning("Could not submit review: " + e.message);
             }
-
-            const DASH = "\u2014\u2014";
-
-            const body = "## AI Code Review\n\n" + review.trim() + "\n\n" + DASH + "YQTEAM BOT\n\n" + MARKER;
-
-            await upsert(body);
