@@ -2,6 +2,11 @@ name: "Bot: AI Auto Fix PR"
 
 # Lets an AI model look for obvious bugs in a few source files and opens a
 # pull request with conservative fixes for a human to review.
+#
+# Scheduled every 3 hours. The pull request is opened with the bot's GitHub
+# App identity when the organization variable BOT_APP_ID and the secret
+# BOT_APP_PRIVATE_KEY are present, so the PR and its comments appear as the
+# bot rather than as the generic github-actions actor.
 # Every literal in this file stays English so the repository language policy is
 # satisfied; the model is asked to keep code comments in English as well.
 #
@@ -10,7 +15,7 @@ name: "Bot: AI Auto Fix PR"
 
 on:
   schedule:
-    - cron: "0 2 * * 1"
+    - cron: "0 */3 * * *"
   workflow_dispatch:
     inputs:
       max_files:
@@ -26,9 +31,19 @@ jobs:
   autofix:
     runs-on: ubuntu-latest
     steps:
+      - name: Mint bot token
+        id: bot
+        if: ${{ vars.BOT_APP_ID != '' }}
+        continue-on-error: true
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.BOT_APP_ID }}
+          private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ github.event.repository.default_branch }}
 
       - name: Run AI fixer
         env:
@@ -137,6 +152,7 @@ jobs:
       - name: Create Pull Request
         uses: peter-evans/create-pull-request@v6
         with:
+          token: ${{ steps.bot.outputs.token || github.token }}
           commit-message: "chore: AI autofix"
           title: "AI autofix suggestions"
           body: |
