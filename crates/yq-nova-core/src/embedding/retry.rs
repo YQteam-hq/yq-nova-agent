@@ -22,12 +22,21 @@ impl MiniRng {
         MiniRng(if seed == 0 { 0x9e37_79b9_7f4a_7c15 } else { seed })
     }
 
+    /// Uniform sample from the inclusive range `[lo, hi]`.
+    ///
+    /// A misordered pair (`lo > hi`, e.g. `base_sleep > max_sleep` in a
+    /// hand-written config) is treated as the same interval with the bounds
+    /// swapped rather than a programming error: callers feed this function
+    /// user-controlled durations, and a panic here would take down the
+    /// process over a config typo.
     fn range_inclusive(&mut self, lo: Duration, hi: Duration) -> Duration {
-        assert!(lo <= hi, "range_inclusive: lo {lo:?} > hi {hi:?}");
+        let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
 
         let lo_ns = lo.as_nanos() as u64;
-        let hi_ns = hi.as_nanos() as u64;
-        if lo_ns == hi_ns {
+        // Keep the upper bound below u64::MAX so `hi_ns - lo_ns + 1` cannot
+        // overflow (Duration::MAX saturates the u128 -> u64 cast).
+        let hi_ns = hi.as_nanos().min(u64::MAX as u128 - 1) as u64;
+        if lo_ns >= hi_ns {
             return Duration::from_nanos(lo_ns);
         }
         let width = hi_ns - lo_ns + 1;
@@ -88,6 +97,12 @@ where
     let mut prev = config.base_sleep;
     let mut last_err: Option<anyhow::Error> = None;
 
+    if config.max_attempts == 0 {
+        return Err(crate::error::NovaError::validation_msg(
+            "embedding retry: max_attempts must be at least 1",
+        ));
+    }
+
     for attempt in 1..=config.max_attempts {
         match body(attempt).await {
             Ok(v) => return Ok(v),
@@ -108,7 +123,9 @@ where
         }
     }
 
-    let last = last_err.expect("with_retry: zero attempts ran");
+    // `max_attempts == 0` is rejected above, so the loop body runs at least
+    // once and every exit path past this point has recorded an error.
+    let last = last_err.expect("with_retry: attempts exhausted without a recorded error");
     Err(crate::error::NovaError::embedding(
         format!("embedding request failed after {} attempts", config.max_attempts),
         last,
@@ -171,6 +188,45 @@ mod tests {
             max_attempts: 2,
             base_sleep: Duration::from_millis(1),
             max_sleep: Duration::from_millis(2),
+            per_attempt_timeout: Duration::from_secs(1),
+        };
+        let count = Cell::new(0u32);
+        let err = with_retry(&cfg, |n| {
+            count.set(n);
+            async move { Err::<u32, _>((RetryAction::Retry, anyhow::anyhow!("{n}"))) }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(count.get(), 2);
+        assert_eq!(err.code(), crate::error::ErrorCode::Embedding);
+    }
+
+    #[tokio::test]
+    async fn retry_zero_attempts_returns_error() {
+        let cfg = RetryConfig {
+            max_attempts: 0,
+            base_sleep: Duration::from_millis(1),
+            max_sleep: Duration::from_millis(2),
+            per_attempt_timeout: Duration::from_secs(1),
+        };
+        let called = Cell::new(false);
+        let res = with_retry(&cfg, |_n| {
+            called.set(true);
+            async move { Ok::<u32, (RetryAction, anyhow::Error)>(0u32) }
+        })
+        .await;
+        assert!(res.is_err(), "max_attempts = 0 must not silently succeed");
+        assert!(!called.get(), "no attempt should run when max_attempts = 0");
+    }
+
+    #[tokio::test]
+    async fn retry_inverted_sleep_bounds_does_not_panic() {
+        // base_sleep > max_sleep: the backoff cap is below the floor, which
+        // used to trip an assert inside the jitter sampler.
+        let cfg = RetryConfig {
+            max_attempts: 2,
+            base_sleep: Duration::from_millis(5),
+            max_sleep: Duration::from_millis(1),
             per_attempt_timeout: Duration::from_secs(1),
         };
         let count = Cell::new(0u32);
