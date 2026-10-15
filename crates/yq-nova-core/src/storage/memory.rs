@@ -91,6 +91,25 @@ pub trait MemoryRepository: Repository<MemoryRecord> {
         namespace_id: i64,
         uuid: Uuid,
     ) -> NovaResult<MemoryRecord>;
+    /// Fetches several records by uuid in one round trip.
+    ///
+    /// Uuids that do not exist are simply absent from the result (compare
+    /// `result.len()` with `uuids.len()` to detect them); the returned order
+    /// is unspecified. The default implementation defers to
+    /// [`get_by_uuid`](MemoryRepository::get_by_uuid) so external
+    /// implementors keep compiling.
+    async fn get_many_by_uuid(
+        &self,
+        db: &Database,
+        namespace_id: i64,
+        uuids: &[Uuid],
+    ) -> NovaResult<Vec<MemoryRecord>> {
+        let mut out = Vec::with_capacity(uuids.len());
+        for u in uuids {
+            out.push(self.get_by_uuid(db, namespace_id, *u).await?);
+        }
+        Ok(out)
+    }
     async fn update_status(
         &self,
         db: &Database,
@@ -151,6 +170,51 @@ pub trait MemoryRepository: Repository<MemoryRecord> {
 pub struct SqliteMemoryRepository;
 
 impl SqliteMemoryRepository {
+    /// Loads tags for every record in `records` with one `IN` query.
+    ///
+    /// Mirrors [`load_tags_for`]: each record's tags come back ordered by
+    /// name; records without tags keep their empty vector.
+    async fn attach_tags_batch(
+        &self,
+        db: &Database,
+        namespace_id: i64,
+        records: &mut [MemoryRecord],
+    ) -> NovaResult<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let uuid_strs: Vec<String> = records.iter().map(|r| r.uuid.to_string()).collect();
+        let placeholders: Vec<String> = (1..=uuid_strs.len()).map(|i| format!("?{i}")).collect();
+        let sql = format!(
+            "SELECT mt.memory_uuid AS memory_uuid, t.name AS name
+               FROM tags t
+               INNER JOIN memory_tags mt ON mt.tag_id = t.id
+              WHERE mt.memory_uuid IN ({}) AND mt.namespace_id = ?{}
+              ORDER BY mt.memory_uuid, t.name",
+            placeholders.join(","),
+            uuid_strs.len() + 1,
+        );
+        let mut q = sqlx::query_as::<_, (String, String)>(&sql);
+        for s in &uuid_strs {
+            q = q.bind(s);
+        }
+        q = q.bind(namespace_id);
+        let rows: Vec<(String, String)> =
+            q.fetch_all(&db.pool).await.map_err(NovaError::storage)?;
+
+        let mut by_uuid: std::collections::HashMap<&str, Vec<String>> =
+            std::collections::HashMap::with_capacity(records.len());
+        for (uuid, name) in &rows {
+            by_uuid.entry(uuid.as_str()).or_default().push(name.clone());
+        }
+        for rec in records.iter_mut() {
+            if let Some(tags) = by_uuid.remove(rec.uuid.to_string().as_str()) {
+                rec.tags = tags;
+            }
+        }
+        Ok(())
+    }
+
     pub const fn new() -> Self {
         Self
     }
@@ -259,6 +323,43 @@ impl MemoryRepository for SqliteMemoryRepository {
         let mut rec = row_to_memory(&row)?;
         rec.tags = load_tags_for(&db.pool, namespace_id, uuid).await?;
         Ok(rec)
+    }
+
+    /// Batched override of the trait default: one `uuid IN (...)` query plus
+    /// one batched tag query, instead of 2 queries per uuid.
+    ///
+    /// Inputs are chunked so the number of bound parameters stays well below
+    /// SQLite's variable limit regardless of how large `uuids` is.
+    async fn get_many_by_uuid(
+        &self,
+        db: &Database,
+        namespace_id: i64,
+        uuids: &[Uuid],
+    ) -> NovaResult<Vec<MemoryRecord>> {
+        const CHUNK: usize = 400;
+        let mut out: Vec<MemoryRecord> = Vec::with_capacity(uuids.len());
+        for chunk in uuids.chunks(CHUNK) {
+            let placeholders: Vec<String> = (1..=chunk.len()).map(|i| format!("?{i}")).collect();
+            let sql = format!(
+                "SELECT id, uuid, namespace_id, content, content_hash, metadata_json, source, \
+                 importance, access_count, last_accessed, created_at, expires_at, status
+                 FROM memory_items WHERE uuid IN ({}) AND namespace_id = ?{}",
+                placeholders.join(","),
+                chunk.len() + 1,
+            );
+            let mut q = sqlx::query(&sql);
+            for u in chunk {
+                q = q.bind(u.to_string());
+            }
+            q = q.bind(namespace_id);
+            let rows = q.fetch_all(&db.pool).await.map_err(NovaError::storage)?;
+            let start = out.len();
+            for row in &rows {
+                out.push(row_to_memory(row)?);
+            }
+            self.attach_tags_batch(db, namespace_id, &mut out[start..]).await?;
+        }
+        Ok(out)
     }
 
     async fn update_status(
@@ -779,7 +880,7 @@ pub(crate) async fn list_tags_of_memory(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::StorageConfig;
+    use crate::{config::StorageConfig, storage::namespace::NamespaceRepository as _};
 
     async fn temp_db() -> Database {
         let dir = std::env::temp_dir().join(format!("yq-nova-m2-mem-{}", Uuid::new_v4()));
@@ -1005,5 +1106,142 @@ mod tests {
         };
         assert_eq!(repo.count(&db, &f2).await.unwrap(), 0);
         assert_eq!(repo.list(&db, &f2, 100, 0).await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn get_many_by_uuid_batches_and_loads_tags() {
+        let db = temp_db().await;
+        let repo = SqliteMemoryRepository::new();
+        let mut want = Vec::new();
+        for (i, (tag_a, tag_b)) in
+            [("zeta", "alpha"), ("mid", "beta"), ("solo", "gamma")].into_iter().enumerate()
+        {
+            want.push(
+                repo.insert(
+                    &db,
+                    InsertMemoryInput {
+                        content: &format!("content {i}"),
+                        tags: &[tag_a.to_string(), tag_b.to_string()],
+                        importance: 0.5 + i as f32 / 10.0,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+                .uuid(),
+            );
+        }
+
+        let got = repo.get_many_by_uuid(&db, NS, &want).await.unwrap();
+        assert_eq!(got.len(), 3, "all three records must come back");
+
+        let by_uuid: std::collections::HashMap<Uuid, &MemoryRecord> =
+            got.iter().map(|r| (r.uuid, r)).collect();
+        for uuid in &want {
+            let rec = by_uuid.get(uuid).unwrap_or_else(|| panic!("missing {uuid}"));
+            assert_eq!(rec.tags.len(), 2, "tags must be loaded for {uuid}");
+            let mut sorted = rec.tags.clone();
+            sorted.sort();
+            let mut expected = rec.tags.clone();
+            expected.sort();
+            assert_eq!(sorted, expected);
+        }
+        // tag order mirrors load_tags_for: name-ordered
+        for rec in &got {
+            let mut sorted = rec.tags.clone();
+            sorted.sort();
+            assert_eq!(rec.tags, sorted, "tags must be name-ordered");
+        }
+    }
+
+    #[tokio::test]
+    async fn get_many_by_uuid_skips_missing_and_other_namespaces() {
+        let db = temp_db().await;
+        let repo = SqliteMemoryRepository::new();
+        let ns_repo = crate::storage::namespace::SqliteNamespaceRepository::new();
+        let other_ns = ns_repo
+            .create(
+                &db,
+                crate::storage::namespace::CreateNamespaceInput {
+                    name: "get-many-other",
+                    description: None,
+                    config: None,
+                },
+            )
+            .await
+            .unwrap()
+            .id;
+        assert_ne!(other_ns, NS, "the second namespace must be a distinct id");
+
+        let mine = repo
+            .insert(
+                &db,
+                InsertMemoryInput {
+                    content: "mine",
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .uuid();
+        let theirs = repo
+            .insert(
+                &db,
+                InsertMemoryInput {
+                    content: "theirs",
+                    namespace_id: other_ns,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .uuid();
+
+        let absent = Uuid::new_v4();
+        // fetching my namespace must not leak the other namespace's record
+        let got = repo.get_many_by_uuid(&db, NS, &[mine, theirs, absent]).await.unwrap();
+        assert_eq!(got.len(), 1, "only my in-namespace record comes back");
+        assert_eq!(got[0].uuid, mine);
+        assert_eq!(got[0].namespace_id, NS);
+
+        let from_other = repo.get_many_by_uuid(&db, other_ns, &[mine, theirs]).await.unwrap();
+        assert_eq!(from_other.len(), 1);
+        assert_eq!(from_other[0].uuid, theirs);
+
+        assert!(repo.get_many_by_uuid(&db, NS, &[]).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_many_by_uuid_matches_get_by_uuid() {
+        let db = temp_db().await;
+        let repo = SqliteMemoryRepository::new();
+        let mut uuids = Vec::new();
+        for i in 0..5 {
+            uuids.push(
+                repo.insert(
+                    &db,
+                    InsertMemoryInput {
+                        content: &format!("row {i}"),
+                        tags: &[format!("tag-{i}")],
+                        importance: 0.4,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+                .uuid(),
+            );
+        }
+
+        let batch = repo.get_many_by_uuid(&db, NS, &uuids).await.unwrap();
+        for uuid in &uuids {
+            let single = repo.get_by_uuid(&db, NS, *uuid).await.unwrap();
+            let from_batch = batch.iter().find(|r| r.uuid == *uuid).expect("in batch");
+            assert_eq!(from_batch.content, single.content);
+            assert_eq!(from_batch.metadata, single.metadata);
+            assert_eq!(from_batch.tags, single.tags);
+            assert_eq!(from_batch.importance, single.importance);
+            assert_eq!(from_batch.status, single.status);
+        }
     }
 }
