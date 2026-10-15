@@ -604,6 +604,57 @@ fn build_filter(filter: &MemoryFilter, count_only: bool) -> BuiltQuery {
         }
     }
 
+    // `metadata_match` used to be applied only by the in-memory
+    // `passes_filter` post-filter, so the SQL layer silently ignored it:
+    // `count` over-reported, `list`/`list_ordered` returned rows that were
+    // later dropped (breaking LIMIT/OFFSET pagination), and `forget` with a
+    // `ForgetTarget::Filter` archived or deleted memories that did not match
+    // at all. Push the predicate down to SQLite so every consumer of
+    // `MemoryFilter` sees the same rows.
+    //
+    // `json_each` exposes object labels as plain TEXT (no JSON-path quoting
+    // problems for keys containing quotes or dots) and its `value` column
+    // holds the SQL value of the member: TEXT for strings, INTEGER/REAL for
+    // numbers, 0/1 for booleans, SQL NULL for JSON null, and the member's
+    // JSON text for arrays/objects.
+    if let Some(pairs) = &filter.metadata_match {
+        for (key, val) in pairs {
+            where_binds.push(BindValue::Text(key.clone()));
+            let value_sql: &str = match val {
+                serde_json::Value::Null => "je.value IS NULL",
+                serde_json::Value::Bool(b) => {
+                    where_binds.push(BindValue::Int(i64::from(*b)));
+                    "je.value = ?"
+                },
+                serde_json::Value::Number(n) => {
+                    let bound = if let Some(i) = n.as_i64() {
+                        BindValue::Int(i)
+                    } else if let Some(u) = n.as_u64() {
+                        BindValue::Int(u as i64)
+                    } else {
+                        BindValue::Real(n.as_f64().unwrap_or(0.0))
+                    };
+                    where_binds.push(bound);
+                    "je.value = ?"
+                },
+                serde_json::Value::String(s) => {
+                    where_binds.push(BindValue::Text(s.clone()));
+                    "je.value = ?"
+                },
+                composite => {
+                    // Arrays/objects: compare the member's JSON text with
+                    // the compact serialization of the expected value.
+                    where_binds.push(BindValue::Text(composite.to_string()));
+                    "je.value = ?"
+                },
+            };
+            where_clauses.push(format!(
+                "EXISTS (SELECT 1 FROM json_each(m.metadata_json) je WHERE je.key = ? AND \
+                 {value_sql})"
+            ));
+        }
+    }
+
     let wc: String = where_clauses.join(" AND ");
     let from_with_joins: String = format!("FROM memory_items m{joins}");
 
@@ -1005,5 +1056,117 @@ mod tests {
         };
         assert_eq!(repo.count(&db, &f2).await.unwrap(), 0);
         assert_eq!(repo.list(&db, &f2, 100, 0).await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn list_and_count_push_metadata_match_into_sql() {
+        let db = temp_db().await;
+        let repo = SqliteMemoryRepository::new();
+        for (name, meta) in [
+            ("a", serde_json::json!({"env": "prod", "level": 3, "on": true, "gone": null})),
+            ("b", serde_json::json!({"env": "dev", "level": 3.5, "on": false})),
+            ("c", serde_json::json!({"env": "prod", "nested": {"k": [1, 2]}})),
+        ] {
+            repo.insert(
+                &db,
+                InsertMemoryInput {
+                    content: name,
+                    metadata: Some(&meta),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        // scalar string equality
+        let f = MemoryFilter {
+            metadata_match: Some(vec![("env".to_string(), serde_json::json!("prod"))]),
+            ..Default::default()
+        };
+        assert_eq!(repo.count(&db, &f).await.unwrap(), 2);
+        let rows = repo.list(&db, &f, 100, 0).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.content == "a" || r.content == "c"));
+
+        // integer and float values bind with their own JSON type
+        let f_int = MemoryFilter {
+            metadata_match: Some(vec![("level".to_string(), serde_json::json!(3))]),
+            ..Default::default()
+        };
+        assert_eq!(repo.count(&db, &f_int).await.unwrap(), 1);
+        let f_float = MemoryFilter {
+            metadata_match: Some(vec![("level".to_string(), serde_json::json!(3.5))]),
+            ..Default::default()
+        };
+        assert_eq!(repo.count(&db, &f_float).await.unwrap(), 1);
+
+        // booleans and explicit JSON nulls
+        let f_bool = MemoryFilter {
+            metadata_match: Some(vec![("on".to_string(), serde_json::json!(true))]),
+            ..Default::default()
+        };
+        assert_eq!(repo.count(&db, &f_bool).await.unwrap(), 1);
+        let f_null = MemoryFilter {
+            metadata_match: Some(vec![("gone".to_string(), serde_json::Value::Null)]),
+            ..Default::default()
+        };
+        assert_eq!(repo.count(&db, &f_null).await.unwrap(), 1, "explicit null must match");
+        // a missing key must NOT match a null filter
+        let f_missing = MemoryFilter {
+            metadata_match: Some(vec![("absent".to_string(), serde_json::Value::Null)]),
+            ..Default::default()
+        };
+        assert_eq!(repo.count(&db, &f_missing).await.unwrap(), 0);
+
+        // composite values compare against their JSON text
+        let f_obj = MemoryFilter {
+            metadata_match: Some(vec![("nested".to_string(), serde_json::json!({"k": [1, 2]}))]),
+            ..Default::default()
+        };
+        assert_eq!(repo.count(&db, &f_obj).await.unwrap(), 1);
+        assert_eq!(repo.list(&db, &f_obj, 100, 0).await.unwrap()[0].content, "c");
+
+        // multiple pairs are ANDed
+        let f_multi = MemoryFilter {
+            metadata_match: Some(vec![
+                ("env".to_string(), serde_json::json!("prod")),
+                ("level".to_string(), serde_json::json!(3)),
+            ]),
+            ..Default::default()
+        };
+        assert_eq!(repo.count(&db, &f_multi).await.unwrap(), 1);
+        assert_eq!(repo.list(&db, &f_multi, 100, 0).await.unwrap()[0].content, "a");
+
+        // keys with quote characters must not break the generated SQL
+        let quoted_uuid = repo
+            .insert(
+                &db,
+                InsertMemoryInput {
+                    content: "quoted",
+                    metadata: Some(&serde_json::json!({"it's": "fine", "say\"hi\"": 1})),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .uuid();
+        let f_quote = MemoryFilter {
+            metadata_match: Some(vec![
+                ("it's".to_string(), serde_json::json!("fine")),
+                ("say\"hi\"".to_string(), serde_json::json!(1)),
+            ]),
+            ..Default::default()
+        };
+        let rows = repo.list(&db, &f_quote, 100, 0).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].uuid, quoted_uuid);
+
+        // an empty pair list matches everything, like passes_filter
+        let f_empty = MemoryFilter {
+            metadata_match: Some(Vec::new()),
+            ..Default::default()
+        };
+        assert_eq!(repo.count(&db, &f_empty).await.unwrap(), 4);
     }
 }

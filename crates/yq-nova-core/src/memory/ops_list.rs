@@ -208,6 +208,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_total_counts_only_rows_matching_metadata_match() {
+        let svc = temp_svc().await;
+        for (content, meta) in [
+            ("match one", serde_json::json!({"env": "prod"})),
+            ("match two", serde_json::json!({"env": "prod"})),
+            ("other", serde_json::json!({"env": "dev"})),
+        ] {
+            svc.remember(RememberInput {
+                content,
+                metadata: Some(&meta),
+                extract_graph: false,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+
+        let out = list_memories(
+            &svc,
+            ListInput {
+                filter: MemoryFilter {
+                    metadata_match: Some(vec![("env".to_string(), serde_json::json!("prod"))]),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.total, 2, "total must count only matching rows");
+        assert_eq!(out.count, 2);
+        assert_eq!(out.items.len(), 2);
+
+        // pagination must not skip matching rows: the SQL layer used to
+        // ignore metadata_match, so LIMIT/OFFSET cut into unfiltered rows
+        // and the post-filter dropped them.
+        let page1 = list_memories(
+            &svc,
+            ListInput {
+                filter: MemoryFilter {
+                    metadata_match: Some(vec![("env".to_string(), serde_json::json!("prod"))]),
+                    ..Default::default()
+                },
+                limit: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let page2 = list_memories(
+            &svc,
+            ListInput {
+                filter: MemoryFilter {
+                    metadata_match: Some(vec![("env".to_string(), serde_json::json!("prod"))]),
+                    ..Default::default()
+                },
+                limit: 1,
+                offset: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(page1.items.len(), 1);
+        assert_eq!(page2.items.len(), 1, "second page must still return a matching row");
+        assert_ne!(page1.items[0].uuid, page2.items[0].uuid);
+    }
+
+    #[tokio::test]
     async fn list_rejects_invalid_limit() {
         let svc = temp_svc().await;
         let zero = list_memories(

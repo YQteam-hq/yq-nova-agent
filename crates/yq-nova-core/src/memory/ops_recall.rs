@@ -561,7 +561,7 @@ pub(crate) fn passes_filter(r: &MemoryRecord, f: &MemoryFilter) -> bool {
         for (key, val) in metadata_match {
             match r.metadata.get(key) {
                 Some(actual) => {
-                    if actual != val {
+                    if !json_values_equal(actual, val) {
                         return false;
                     }
                 },
@@ -570,6 +570,18 @@ pub(crate) fn passes_filter(r: &MemoryRecord, f: &MemoryFilter) -> bool {
         }
     }
     true
+}
+
+/// JSON equality for `metadata_match` values.
+///
+/// Numbers compare numerically (3 matches 3.0) so the in-memory check agrees
+/// with the SQL predicate in `build_filter`, where SQLite compares INTEGER
+/// and REAL members across storage classes.
+fn json_values_equal(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    match (a, b) {
+        (serde_json::Value::Number(x), serde_json::Value::Number(y)) => x.as_f64() == y.as_f64(),
+        _ => a == b,
+    }
 }
 
 #[cfg(test)]
