@@ -201,6 +201,22 @@ impl RelationRepository for SqliteRelationRepository {
                 input.target_uuid
             )));
         }
+        if let Some(mem_uuid) = input.memory_uuid {
+            let mem_exists: Option<(String,)> = sqlx::query_as(
+                "SELECT uuid FROM memory_items WHERE uuid = ?1 AND namespace_id = ?2",
+            )
+            .bind(mem_uuid.to_string())
+            .bind(ns)
+            .fetch_optional(pool)
+            .await
+            .map_err(NovaError::storage)?;
+            if mem_exists.is_none() {
+                return Err(NovaError::validation(format!(
+                    "relation.memory_uuid {0} does not exist in namespace {1}",
+                    mem_uuid, ns
+                )));
+            }
+        }
 
         let metadata_json = input.metadata.cloned().unwrap_or_else(|| serde_json::json!({}));
         let memory_uuid_s: Option<String> = input.memory_uuid.map(|u| u.to_string());
@@ -529,7 +545,11 @@ mod tests {
     use super::*;
     use crate::{
         config::StorageConfig,
-        storage::entity::{EntityRepository, SqliteEntityRepository, UpsertEntityInput},
+        storage::{
+            entity::{EntityRepository, SqliteEntityRepository, UpsertEntityInput},
+            memory::{InsertMemoryInput, MemoryRepository, SqliteMemoryRepository},
+            namespace::{CreateNamespaceInput, NamespaceRepository, SqliteNamespaceRepository},
+        },
     };
 
     const NS: i64 = crate::storage::namespace::DEFAULT_NAMESPACE_ID;
@@ -655,6 +675,109 @@ mod tests {
             .await
             .unwrap();
         rr.get_by_uuid(&db, NS, ok.uuid()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn insert_rejects_memory_uuid_from_another_namespace() {
+        let db = temp_db().await;
+        let rr = SqliteRelationRepository::new();
+        let nr = SqliteNamespaceRepository;
+        let other = nr
+            .create(
+                &db,
+                CreateNamespaceInput {
+                    name: "other-tenant",
+                    description: None,
+                    config: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let mr = SqliteMemoryRepository::new();
+        let foreign_mem = mr
+            .insert(
+                &db,
+                InsertMemoryInput {
+                    namespace_id: NS,
+                    content: "memory owned by the default namespace",
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .uuid();
+
+        let er = SqliteEntityRepository::new();
+        let (a, b) = {
+            let mk = |name: &'static str| {
+                er.upsert(
+                    &db,
+                    UpsertEntityInput {
+                        namespace_id: other.id,
+                        name,
+                        r#type: "node",
+                        description: None,
+                        metadata: None,
+                    },
+                )
+            };
+            let au = mk("Src").await.unwrap().uuid();
+            let bu = mk("Tgt").await.unwrap().uuid();
+            (au, bu)
+        };
+
+        // The entities live in `other`, the memory in the default namespace:
+        // a relation must not be able to point across the tenant boundary.
+        let cross = rr
+            .insert(
+                &db,
+                InsertRelationInput {
+                    namespace_id: other.id,
+                    source_uuid: a,
+                    target_uuid: b,
+                    predicate: "derived_from",
+                    confidence: 1.0,
+                    memory_uuid: Some(foreign_mem),
+                    metadata: None,
+                    idempotent: false,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(cross.code(), crate::error::ErrorCode::Validation);
+
+        // The same relation with an in-namespace memory is accepted.
+        let own_mem = mr
+            .insert(
+                &db,
+                InsertMemoryInput {
+                    namespace_id: other.id,
+                    content: "memory owned by the other tenant",
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .uuid();
+        let ok = rr
+            .insert(
+                &db,
+                InsertRelationInput {
+                    namespace_id: other.id,
+                    source_uuid: a,
+                    target_uuid: b,
+                    predicate: "derived_from",
+                    confidence: 1.0,
+                    memory_uuid: Some(own_mem),
+                    metadata: None,
+                    idempotent: false,
+                },
+            )
+            .await
+            .unwrap();
+        let got = rr.get_by_uuid(&db, other.id, ok.uuid()).await.unwrap();
+        assert_eq!(got.memory_uuid, Some(own_mem));
     }
 
     #[tokio::test]
