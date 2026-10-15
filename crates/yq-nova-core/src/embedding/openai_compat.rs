@@ -7,6 +7,7 @@ use serde_with::serde_as;
 use super::{
     EmbeddingMeta, EmbeddingProvider,
     retry::{RetryAction, RetryConfig, classify_http_status, with_retry},
+    truncate_utf8,
 };
 use crate::error::NovaResult;
 
@@ -144,7 +145,7 @@ impl OpenAiCompatProvider {
             let status = res.status();
             if !status.is_success() {
                 let text = res.text().await.unwrap_or_default();
-                let snippet = if text.len() > 400 { &text[..400] } else { text.as_str() };
+                let snippet = truncate_utf8(&text, 400);
                 return Err((
                     classify_http_status(status),
                     anyhow::anyhow!("HTTP {}: {}", status.as_u16(), snippet),
@@ -210,6 +211,37 @@ impl EmbeddingProvider for OpenAiCompatProvider {
 mod tests {
     use super::*;
 
+    async fn spawn_mock_server(body: String, status: u16) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = [0u8; 8192];
+            let mut read = 0usize;
+            loop {
+                let n = socket.read(&mut buffer[read..]).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                read += n;
+                if buffer[..read].windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let reason = if status == 200 { "OK" } else { "Error" };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: text/plain\r\nContent-Length: \
+                 {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.flush().await;
+        });
+        (format!("http://{addr}"), handle)
+    }
+
     #[test]
     fn config_defaults_sane() {
         let c = OpenAiCompatConfig::default();
@@ -261,5 +293,35 @@ mod tests {
         let p = OpenAiCompatProvider::new(cfg).unwrap();
         assert_eq!(p.endpoint, "https://example.com/v1/embeddings");
         assert_eq!(p.meta().provider, "openai_compat");
+    }
+
+    #[tokio::test]
+    async fn multibyte_error_body_does_not_panic() {
+        // 200 three-byte characters = 600 bytes; byte 400 lands inside a
+        // character, so a naive `&body[..400]` would panic while an error
+        // message is being built.
+        let body = "中".repeat(200);
+        assert!(body.len() > 400);
+        assert!(!body.is_char_boundary(400));
+
+        let (base, server) = spawn_mock_server(body, 400).await;
+        let cfg = OpenAiCompatConfig {
+            base_url: base,
+            model: "m".into(),
+            dims: 4,
+            batch_size: 1,
+            request_timeout: Duration::from_secs(5),
+            retry: RetryConfig {
+                max_attempts: 1,
+                ..RetryConfig::default()
+            },
+            ..OpenAiCompatConfig::default()
+        };
+        let provider = OpenAiCompatProvider::new(cfg).unwrap();
+
+        let err = provider.embed_batch(&["hello"]).await.unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("HTTP 400"), "unexpected error message: {message}");
+        server.abort();
     }
 }

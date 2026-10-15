@@ -180,4 +180,29 @@ mod tests {
         assert!(r.get("default").is_some());
         assert!(r.get("nope").is_none());
     }
+
+    #[test]
+    fn truncate_utf8_never_splits_a_character() {
+        // 600 bytes of three-byte characters; byte 400 falls inside one, so a
+        // naive `&text[..400]` would panic. The helper must floor to the start
+        // of that character instead.
+        let text = "中".repeat(200);
+        assert!(!text.is_char_boundary(400));
+        let out = truncate_utf8(&text, 400);
+        assert_eq!(out, "中".repeat(133));
+        assert!(out.len() <= 400);
+
+        // Within the limit the input is returned unchanged.
+        assert_eq!(truncate_utf8("abc", 400), "abc");
+
+        // Whatever the limit, the result is a prefix that never exceeds it and
+        // always ends on a character boundary.
+        let mixed = "aé中→";
+        for max in 0..=mixed.len() + 1 {
+            let out = truncate_utf8(mixed, max);
+            assert!(out.len() <= max, "max={max} produced {out:?}");
+            assert!(out.is_char_boundary(out.len()));
+            assert_eq!(out, &mixed[..out.len()]);
+        }
+    }
 }
