@@ -223,37 +223,14 @@ pub async fn list_relations(
     let repo = SqliteRelationRepository::new();
     let db = &state.db;
     let limit = q.limit.min(500);
-    let total_limit = limit.saturating_add(q.offset);
-
-    let mut rows: Vec<RelationRecord> = Vec::new();
-
-    if let Some(src) = q.source {
-        let got = repo.list_outgoing(db, ns.id, src, q.predicate.as_deref(), total_limit).await?;
-        if let Some(tgt) = q.target {
-            rows.extend(got.into_iter().filter(|r| r.target_uuid == tgt));
-        } else {
-            rows = got;
-        }
-    } else if let Some(tgt) = q.target {
-        let got = repo.list_incoming(db, ns.id, tgt, q.predicate.as_deref(), total_limit).await?;
-        rows = got;
-    } else {
-        let ent_repo = SqliteEntityRepository::new();
-        let ents = ent_repo.list(db, ns.id, None, None, 50, 0).await?;
-        for e in ents {
-            if rows.len() >= total_limit {
-                break;
-            }
-            let mut got =
-                repo.list_outgoing(db, ns.id, e.uuid, q.predicate.as_deref(), total_limit).await?;
-            rows.append(&mut got);
-        }
-        rows.sort_by_key(|r| std::cmp::Reverse(r.id));
-        rows.dedup_by_key(|r| r.id);
-    }
-
-    let trimmed: Vec<RelationRecord> = rows.into_iter().skip(q.offset).take(limit).collect();
-    Ok(Json(trimmed))
+    // Filtering and pagination happen in one query so that relations attached
+    // to any entity of the namespace are reachable. Walking the entities and
+    // calling `list_outgoing` per entity used to cap the result at an arbitrary
+    // number of entities and then apply `offset` to the truncated set.
+    let rows = repo
+        .list_page(db, ns.id, q.source, q.target, q.predicate.as_deref(), limit, q.offset)
+        .await?;
+    Ok(Json(rows))
 }
 
 pub async fn traverse(
