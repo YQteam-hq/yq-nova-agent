@@ -84,8 +84,36 @@ The client covers every v1 endpoint: `health`, `stats`, `remember`,
 `update_memory`, `delete_memory`, `export_memories`, `import_memories`,
 `merge_memories`, `list_tags`, `rename_tag`, `delete_tag`, `upsert_entity`,
 `list_entities`, `merge_entities`, `upsert_relation`, `list_relations`,
-`traverse` and `extract_and_link`. A runnable walkthrough of all of them is in
+`traverse`, `extract_and_link` and the five namespace admin methods
+(`list_namespaces`, `get_namespace`, `create_namespace`, `update_namespace`,
+`delete_namespace`). A runnable walkthrough of all of them is in
 [`examples/full_api_demo.py`](examples/full_api_demo.py).
+
+## Multi-tenant namespaces
+
+By default the client talks to the `default` namespace. Pass `namespace=` to
+scope every request to one tenant — it is sent as the `x-namespace` header,
+which the server uses to route reads and writes:
+
+```python
+client = Client("http://127.0.0.1:7999", namespace="team-acme")
+
+# Retarget the same client at another tenant and keep using it
+client.with_namespace("team-beta")
+print(client.namespace)  # 'team-beta'
+```
+
+Omitting the namespace leaves the header out entirely, which makes the server
+fall back to `default`. A blank namespace is rejected client-side, matching
+the server. Namespace admin (server-side management, not tenant-scoped):
+
+```python
+client.create_namespace("team-acme", description="Acme Corp")
+print(client.list_namespaces(limit=50))
+print(client.get_namespace("team-acme"))
+client.update_namespace("team-acme", description="Acme Corporation")
+client.delete_namespace("team-acme")  # 'default' itself is reserved
+```
 
 ## Errors
 

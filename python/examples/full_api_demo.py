@@ -104,6 +104,22 @@ def main() -> None:
         except NovaApiError as err:
             print("expected error", err.status, err.code)
 
+    # Namespace admin (requires an admin-scoped API key; tenant keys get 403).
+    # Runs last and on its own client so the walkthrough above stays scoped
+    # to whatever namespace it started in.
+    try:
+        admin = Client(base_url, api_key=api_key)
+        created = admin.create_namespace("demo-tenant", description="demo namespace")
+        print("created namespace", created["name"])
+        print("namespaces", [item["name"] for item in admin.list_namespaces(limit=10).get("items", [])])
+        admin.update_namespace("demo-tenant", description="demo namespace v2")
+        scoped = Client(base_url, api_key=api_key, namespace="demo-tenant")
+        print("scoped client sees namespace", scoped.namespace)
+        admin.delete_namespace("demo-tenant")
+        print("deleted namespace demo-tenant")
+    except NovaApiError as err:
+        print("namespace admin skipped:", err.status, err.code)
+
 
 if __name__ == "__main__":
     main()

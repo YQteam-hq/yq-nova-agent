@@ -32,6 +32,7 @@ class Client:
         base_url: str,
         api_key: Optional[str] = None,
         timeout: float = 30.0,
+        namespace: Optional[str] = None,
     ) -> None:
         base = base_url.rstrip("/")
         if not base:
@@ -39,6 +40,31 @@ class Client:
         self.base_url = base
         self.api_key = api_key
         self.timeout = timeout
+        self.namespace = self._validate_namespace(namespace)
+
+    @staticmethod
+    def _validate_namespace(namespace: Optional[str]) -> Optional[str]:
+        """Trims a configured namespace and rejects a blank one.
+
+        Mirrors the server, which treats a missing ``x-namespace`` header as
+        ``default`` but rejects an empty header value; trimming matches the
+        server's own ``name.trim()`` before the name is used.
+        """
+        if namespace is None:
+            return None
+        trimmed = namespace.strip()
+        if not trimmed:
+            raise ValueError("namespace must not be empty when provided")
+        return trimmed
+
+    def with_namespace(self, name: str) -> "Client":
+        """Retargets this client at another namespace and returns it.
+
+        Mirrors ``HttpClient::with_namespace`` for callers that talk to
+        several tenants from one client instance.
+        """
+        self.namespace = self._validate_namespace(name)
+        return self
 
     def _request(
         self,
@@ -58,6 +84,8 @@ class Client:
         }
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
+        if self.namespace:
+            headers["x-namespace"] = self.namespace
 
         data = None
         if body is not None:
@@ -456,6 +484,63 @@ class Client:
             merged.update(opts)
         body = {"text": text, "opts": merged}
         return self._request("POST", "/v1/graph/extract-and-link", body)
+
+    def list_namespaces(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> Dict[str, Any]:
+
+        if limit < 1:
+            raise ValueError("list_namespaces: limit must be >= 1")
+        return self._request(
+            "GET", "/v1/namespaces", params={"limit": limit, "offset": offset}
+        )
+
+    def get_namespace(self, name: str) -> Dict[str, Any]:
+
+        if not name or not name.strip():
+            raise ValueError("get_namespace: name must be non-empty")
+        return self._request("GET", f"/v1/namespaces/{_quote(name.strip())}")
+
+    def create_namespace(
+        self,
+        name: str,
+        description: Optional[str] = None,
+        config: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+
+        trimmed = (name or "").strip()
+        if not trimmed:
+            raise ValueError("create_namespace: name must be non-empty")
+        if trimmed.lower() == "default":
+            raise ValueError("create_namespace: 'default' is reserved")
+        body: Dict[str, Any] = {
+            "name": trimmed,
+            "description": description,
+            "config": config if config is not None else {},
+        }
+        return self._request("POST", "/v1/namespaces", body)
+
+    def update_namespace(
+        self,
+        name: str,
+        description: Optional[str] = None,
+        config: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+
+        if not name or not name.strip():
+            raise ValueError("update_namespace: name must be non-empty")
+        body: Dict[str, Any] = {"description": description, "config": config}
+        return self._request(
+            "PATCH", f"/v1/namespaces/{_quote(name.strip())}", body
+        )
+
+    def delete_namespace(self, name: str) -> Dict[str, Any]:
+
+        if not name or not name.strip():
+            raise ValueError("delete_namespace: name must be non-empty")
+        return self._request("DELETE", f"/v1/namespaces/{_quote(name.strip())}")
 
 def _quote(value: str) -> str:
 
