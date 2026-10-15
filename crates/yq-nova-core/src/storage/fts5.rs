@@ -122,10 +122,13 @@ impl Fts5Store for SqliteFts5Store {
             .await
             .map_err(|e| NovaError::validation_msg(format!("fts5 query invalid ({q:?}): {e}")))?;
 
-        let raw: Vec<(Uuid, f32)> = rows
-            .into_iter()
-            .map(|(u, b)| (Uuid::parse_str(&u).map_err(NovaError::storage).unwrap(), b as f32))
-            .collect();
+        let mut raw: Vec<(Uuid, f32)> = Vec::with_capacity(rows.len());
+        for (u, b) in rows {
+            let uuid = Uuid::parse_str(&u).map_err(|e| {
+                NovaError::storage_msg(format!("fts5 row has malformed uuid {u:?}: {e}"))
+            })?;
+            raw.push((uuid, b as f32));
+        }
         if raw.is_empty() {
             return Ok(vec![]);
         }
@@ -277,5 +280,32 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(both.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn fts_malformed_uuid_returns_error_not_panic() {
+        let (db, _, store) = setup().await;
+        // Simulate a corrupted row: the FTS entry stays in sync (the AFTER
+        // INSERT trigger indexes the content) while the uuid column holds a
+        // value that cannot parse.
+        sqlx::query(
+            "INSERT INTO memory_items (
+                uuid, namespace_id, content, content_hash, metadata_json, source, importance,
+                access_count, last_accessed, created_at, expires_at, status
+            ) VALUES (
+                'not-a-uuid', ?1, 'corruptible row for uuid parsing', 'corrupt-hash', '{}',
+                'agent', 0.5, 0, NULL, strftime('%s','now'), NULL, 'active'
+            )",
+        )
+        .bind(NS)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let err = store
+            .keyword_search(&db, NS, "corruptible", 10, &[MemoryStatus::Active])
+            .await
+            .expect_err("malformed uuid must surface as an error, not a panic");
+        assert!(err.to_string().contains("malformed uuid"), "unexpected error: {err}");
     }
 }
