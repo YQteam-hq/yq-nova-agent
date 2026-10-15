@@ -15,6 +15,10 @@ use yq_nova_core::{
 pub fn build_default_provider(
     cfg: &EmbeddingConfig,
 ) -> NovaResult<(String, SharedEmbeddingProvider, usize)> {
+    // Reject an unresolvable default_provider up front with the full provider
+    // inventory, before any provider constructor runs.
+    cfg.validate_provider_references()?;
+
     let key = cfg.default_provider.trim().to_string();
     if key.is_empty() {
         return Err(NovaError::config_msg("embedding.default_provider must be non-empty"));
