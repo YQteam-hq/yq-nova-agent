@@ -92,7 +92,7 @@ impl Fts5Store for SqliteFts5Store {
             return Ok(vec![]);
         }
         if statuses.is_empty() {
-            return Err(NovaError::validation_msg("keyword_search statuses must be non-empty"));
+            return Err(NovaError::validation("keyword_search statuses must be non-empty"));
         }
 
         let placeholders: Vec<&str> = statuses.iter().map(|_| "?").collect();
@@ -120,7 +120,7 @@ impl Fts5Store for SqliteFts5Store {
         let rows = built
             .fetch_all(&db.pool)
             .await
-            .map_err(|e| NovaError::validation_msg(format!("fts5 query invalid ({q:?}): {e}")))?;
+            .map_err(|e| NovaError::validation(format!("fts5 query invalid ({q:?}): {e}")))?;
 
         let raw: Vec<(Uuid, f32)> = rows
             .into_iter()
