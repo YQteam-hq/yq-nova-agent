@@ -1,6 +1,8 @@
 import type {
   BatchRememberInput,
   BatchRememberOutput,
+  CreateNamespaceInput,
+  DeleteNamespaceOutput,
   EntityRecord,
   ExportInput,
   ExtractLinkInput,
@@ -19,6 +21,8 @@ import type {
   MergeInput,
   MergeOutput,
   MemoryRecord,
+  NamespaceListOutput,
+  NamespaceRecord,
   RecallInput,
   RecallOutput,
   RememberInput,
@@ -28,6 +32,7 @@ import type {
   TagListOutput,
   TraverseInput,
   UpdateMemoryInput,
+  UpdateNamespaceInput,
   UpsertEntityInput,
   UpsertEntityOutput,
   UpsertRelationInput,
@@ -38,6 +43,8 @@ export interface NovaClientOptions {
   apiKey?: string;
   timeoutMs?: number;
   fetch?: typeof fetch;
+  /** Tenant this client talks to; sent as the `x-namespace` header. */
+  namespace?: string;
 }
 
 export class NovaApiError extends Error {
@@ -66,6 +73,7 @@ export class NovaClient {
   private readonly apiKey?: string;
   private readonly timeoutMs: number;
   private readonly fetchImpl: typeof fetch;
+  private ns: string | undefined;
 
   constructor(baseUrl: string, options: NovaClientOptions = {}) {
     if (!baseUrl) {
@@ -78,6 +86,22 @@ export class NovaClient {
     if (!this.fetchImpl) {
       throw new Error("A fetch implementation is required; Node 18+ and browsers provide one globally");
     }
+    this.ns = normaliseNamespace(options.namespace);
+  }
+
+  /** The tenant this client currently talks to, if any. */
+  get namespace(): string | undefined {
+    return this.ns;
+  }
+
+  /**
+   * Retargets this client at another namespace and returns it, so calls
+   * chain. Mirrors `HttpClient::with_namespace` in the Rust SDK for
+   * callers that talk to several tenants from one client.
+   */
+  withNamespace(name: string): this {
+    this.ns = normaliseNamespace(name);
+    return this;
   }
 
   health() {
@@ -172,6 +196,41 @@ export class NovaClient {
     return this.request<Record<string, unknown>>("POST", "/v1/graph/extract-and-link", input);
   }
 
+  listNamespaces(limit = 100, offset = 0) {
+    if (limit < 1) {
+      throw new Error("listNamespaces: limit must be >= 1");
+    }
+    return this.request<NamespaceListOutput>("GET", "/v1/namespaces", undefined, { limit, offset });
+  }
+
+  getNamespace(name: string) {
+    const trimmed = requireNonEmpty(name, "getNamespace");
+    return this.request<NamespaceRecord>("GET", `/v1/namespaces/${this.quote(trimmed)}`);
+  }
+
+  createNamespace(input: CreateNamespaceInput) {
+    const trimmed = requireNonEmpty(input.name, "createNamespace");
+    if (trimmed.toLowerCase() === "default") {
+      throw new Error("createNamespace: 'default' is reserved");
+    }
+    const body: CreateNamespaceInput = {
+      name: trimmed,
+      description: input.description ?? null,
+      config: input.config ?? {},
+    };
+    return this.request<NamespaceRecord>("POST", "/v1/namespaces", body);
+  }
+
+  updateNamespace(name: string, input: UpdateNamespaceInput = {}) {
+    const trimmed = requireNonEmpty(name, "updateNamespace");
+    return this.request<NamespaceRecord>("PATCH", `/v1/namespaces/${this.quote(trimmed)}`, input);
+  }
+
+  deleteNamespace(name: string) {
+    const trimmed = requireNonEmpty(name, "deleteNamespace");
+    return this.request<DeleteNamespaceOutput>("DELETE", `/v1/namespaces/${this.quote(trimmed)}`);
+  }
+
   private async request<T>(
     method: string,
     path: string,
@@ -189,6 +248,9 @@ export class NovaClient {
     }
     if (this.apiKey) {
       headers["Authorization"] = `Bearer ${this.apiKey}`;
+    }
+    if (this.ns) {
+      headers["x-namespace"] = this.ns;
     }
 
     const controller = "AbortController" in globalThis ? new AbortController() : undefined;
@@ -267,4 +329,28 @@ export class NovaClient {
 function bodySnippet(text: string): string {
   const s = text.replace(/\s+/g, " ").trim();
   return s.length > 160 ? `${s.slice(0, 160)}...` : s;
+}
+
+/**
+ * Trims a configured namespace and rejects a blank one. Mirrors the server,
+ * which treats a missing `x-namespace` header as `default` but rejects an
+ * empty header value; trimming matches the server's own `name.trim()`.
+ */
+function normaliseNamespace(namespace: string | undefined): string | undefined {
+  if (namespace === undefined) {
+    return undefined;
+  }
+  const trimmed = namespace.trim();
+  if (!trimmed) {
+    throw new Error("namespace must not be empty when provided");
+  }
+  return trimmed;
+}
+
+function requireNonEmpty(value: string, method: string): string {
+  const trimmed = (value ?? "").trim();
+  if (!trimmed) {
+    throw new Error(`${method}: name must be non-empty`);
+  }
+  return trimmed;
 }

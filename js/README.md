@@ -76,6 +76,39 @@ const client = new NovaClient("http://127.0.0.1:7999", {
 | `upsertRelation()` | `POST /v1/graph/relations` |
 | `listRelations()` | `GET /v1/graph/relations` |
 | `traverse()` | `POST /v1/graph/traverse` |
+| `listNamespaces()` | `GET /v1/namespaces` |
+| `getNamespace()` | `GET /v1/namespaces/:name` |
+| `createNamespace()` | `POST /v1/namespaces` |
+| `updateNamespace()` | `PATCH /v1/namespaces/:name` |
+| `deleteNamespace()` | `DELETE /v1/namespaces/:name` |
+
+## Multi-tenant namespaces
+
+By default the client talks to the `default` namespace. Pass `namespace` to
+scope every request to one tenant — it is sent as the `x-namespace` header,
+which the server uses to route reads and writes:
+
+```ts
+const client = new NovaClient("http://127.0.0.1:7999", {
+  namespace: "team-acme",
+});
+
+// Retarget the same client at another tenant and keep using it
+client.withNamespace("team-beta");
+console.log(client.namespace); // 'team-beta'
+```
+
+Omitting the namespace leaves the header out entirely, so the server falls
+back to `default`. A blank namespace is rejected client-side, matching the
+server. Namespace admin (server-side management, not tenant-scoped):
+
+```ts
+await client.createNamespace({ name: "team-acme", description: "Acme Corp" });
+console.log((await client.listNamespaces(50)).items);
+console.log(await client.getNamespace("team-acme"));
+await client.updateNamespace("team-acme", { description: "Acme Corporation" });
+await client.deleteNamespace("team-acme"); // 'default' itself is reserved
+```
 
 ## Errors
 
