@@ -443,7 +443,30 @@ Then add the following to the configuration file of **Claude Desktop** or anothe
 }
 ```
 
-The MCP server exposes six tools: `nova_remember`, `nova_recall`, `nova_forget`, `nova_memory_update`, `nova_stats` and `nova_traverse`. AI clients discover and call them automatically.
+The MCP server exposes eight tools: `nova_remember`, `nova_recall`, `nova_forget`, `nova_memory_update`, `nova_stats`, `nova_traverse`, `nova_list` and `nova_tags`. AI clients discover and call them automatically.
+
+#### Namespace (tenant) scoping
+
+By default the MCP server serves the `default` namespace. Pass `--namespace <name>` to serve a specific tenant: every tool call — reads and writes — is scoped to it, so an MCP client can never read or mutate another tenant's memories. The name must already exist (create it first via `POST /v1/namespaces`); an unknown or blank name is a startup error instead of a silent fallback into `default`.
+
+```bash
+./yq-nova-mcp --db-path ./nova.db --namespace team-acme
+```
+
+Equivalent MCP client configuration:
+
+```json
+{
+  "mcpServers": {
+    "yq-nova": {
+      "command": "./yq-nova-mcp",
+      "args": ["--db-path", "./nova.db", "--namespace", "team-acme"]
+    }
+  }
+}
+```
+
+To give each tenant its own MCP server process, point several client entries at the same database with different `--namespace` values.
 
 ### OpenAI tool-calling schema example
 
