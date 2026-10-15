@@ -89,7 +89,11 @@ fn chunk_by_paragraph(text: &str, max_chars: usize, overlap_chars: usize) -> Vec
 
             if overlap_chars > 0 {
                 let take = overlap_chars.min(current.len());
-                current = current[current.len() - take..].to_string();
+                // `current` may contain multi-byte UTF-8 sequences, so move the
+                // cut point forward to the next char boundary instead of
+                // slicing at an arbitrary byte offset.
+                let tail_start = ceil_char_boundary(&current, current.len() - take);
+                current = current[tail_start..].to_string();
                 current.push_str("\n\n");
                 current.push_str(trimmed);
             } else {
@@ -122,12 +126,48 @@ fn chunk_by_char(text: &str, max_chars: usize, overlap_chars: usize) -> Vec<Stri
     let mut chunks: Vec<String> = Vec::new();
     let mut start = 0;
     while start < len {
-        let end = (start + max_chars).min(len);
+        // Floor the cut point to a char boundary so a multi-byte UTF-8
+        // sequence is never split across two chunks.
+        let end = floor_char_boundary(text, (start + max_chars).min(len));
+        if end <= start {
+            // The character at `start` is wider than `max_chars`; skip past it
+            // so the loop always makes progress.
+            start = ceil_char_boundary(text, start + 1);
+            continue;
+        }
         chunks.push(text[start..end].to_string());
-        start += step;
+        // `step` is a byte count, so round the next start up to the following
+        // char boundary instead of slicing from a mid-character offset.
+        start = ceil_char_boundary(text, start + step);
     }
 
     chunks
+}
+
+/// Largest char boundary in `s` that is `<= i` (or `s.len()` when `i` is past
+/// the end).
+fn floor_char_boundary(s: &str, i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    let mut i = i;
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Smallest char boundary in `s` that is `>= i` (or `s.len()` when `i` is past
+/// the end).
+fn ceil_char_boundary(s: &str, i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    let mut i = i;
+    while !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
 }
 
 #[cfg(test)]
@@ -270,6 +310,84 @@ mod tests {
         let opts = ChunkOptions::default();
         let chunks = chunk_text("", &opts);
         assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn char_chunks_never_split_multibyte_utf8() {
+        // The arrow character is three bytes wide, so a byte-oriented cut at
+        // max_chars lands inside a character and used to panic.
+        let text: String = "\u{2192}".repeat(600);
+        let opts = ChunkOptions {
+            enabled: true,
+            split_by: SplitBy::Char,
+            max_chars: 200,
+            overlap_chars: 30,
+        };
+        let chunks = chunk_text(&text, &opts);
+        assert!(chunks.len() > 1, "expected multiple chunks, got {}", chunks.len());
+        for c in &chunks {
+            assert!(!c.is_empty());
+            assert!(c.len() <= 200, "chunk exceeds max_chars: {} bytes", c.len());
+            assert_eq!(c.len() % 3, 0, "chunk must hold whole 3-byte characters");
+        }
+    }
+
+    #[test]
+    fn char_chunks_cover_ascii_boundary_exactly() {
+        let text = "a".repeat(1000);
+        let opts = ChunkOptions {
+            enabled: true,
+            split_by: SplitBy::Char,
+            max_chars: 250,
+            overlap_chars: 0,
+        };
+        let chunks = chunk_text(&text, &opts);
+        assert_eq!(chunks.len(), 4);
+        assert_eq!(chunks.iter().map(|c| c.len()).sum::<usize>(), 1000);
+    }
+
+    #[test]
+    fn paragraph_overlap_never_splits_multibyte_utf8() {
+        let mut text = String::new();
+        for i in 0..20 {
+            if i > 0 {
+                text.push_str("\n\n");
+            }
+            text.push_str(&format!(
+                "Paragraph {} contains arrow characters \u{2192}\u{2192}\u{2192} to exercise \
+                 overlap cuts on multi-byte text.",
+                i
+            ));
+        }
+        let opts = ChunkOptions {
+            enabled: true,
+            split_by: SplitBy::Paragraph,
+            max_chars: 200,
+            overlap_chars: 30,
+        };
+        let chunks = chunk_text(&text, &opts);
+        assert!(chunks.len() > 1, "expected multiple chunks, got {}", chunks.len());
+        for c in &chunks {
+            assert!(!c.is_empty());
+            assert!(c.len() <= 200 + 30, "chunk exceeds max_chars + overlap: {} bytes", c.len());
+        }
+    }
+
+    #[test]
+    fn emoji_chunks_never_split_multibyte_utf8() {
+        // Emoji are four bytes and frequently appear in agent memories.
+        let text: String = "\u{1f389}".repeat(300);
+        let opts = ChunkOptions {
+            enabled: true,
+            split_by: SplitBy::Char,
+            max_chars: 200,
+            overlap_chars: 0,
+        };
+        let chunks = chunk_text(&text, &opts);
+        assert!(chunks.len() > 1);
+        for c in &chunks {
+            assert_eq!(c.chars().count() * 4, c.len(), "every chunk must hold whole emoji");
+        }
     }
 
     #[test]
