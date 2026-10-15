@@ -235,8 +235,14 @@ impl VectorStore for SqliteVectorStore {
             }
         }
 
+        // Break similarity ties on the memory uuid so the result order is
+        // deterministic: the input order comes from a SQL query without
+        // ORDER BY, which SQLite does not guarantee to be stable.
         hits.sort_by(|a, b| {
-            b.similarity.partial_cmp(&a.similarity).unwrap_or(std::cmp::Ordering::Equal)
+            b.similarity
+                .partial_cmp(&a.similarity)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.memory_uuid.cmp(&b.memory_uuid))
         });
         hits.truncate(k);
         Ok(hits)
@@ -366,6 +372,50 @@ mod tests {
         let hi = store.knn_search(NS, &q, 5, 0.9).await.unwrap();
         assert_eq!(hi.len(), 1);
         assert_eq!(hi[0].memory_uuid, u0);
+    }
+
+    #[tokio::test]
+    async fn knn_ties_are_ordered_deterministically() {
+        let db = temp_db().await;
+        let mem = SqliteMemoryRepository::new();
+        let store = SqliteVectorStore::with_db(&db, 3);
+        const NS: i64 = crate::storage::namespace::DEFAULT_NAMESPACE_ID;
+
+        // Five memories holding the exact same vector: every similarity is a
+        // tie, so only the uuid tie-break can order the result. The backing
+        // query has no ORDER BY, so without the tie-break the order follows
+        // whatever row order SQLite happens to return.
+        let mut uuids = Vec::new();
+        let contents: Vec<String> = (0..5).map(|i| format!("tie {i}")).collect();
+        for c in &contents {
+            let u = mem
+                .insert(
+                    &db,
+                    InsertMemoryInput {
+                        content: c,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+                .uuid();
+            store.insert_vector(NS, u, "t", "m", &[1.0_f32, 0.0, 0.0]).await.unwrap();
+            uuids.push(u);
+        }
+        uuids.sort();
+
+        let q = [1.0f32, 0.0, 0.0];
+        let first = store.knn_search(NS, &q, 10, 0.0).await.unwrap();
+        let second = store.knn_search(NS, &q, 10, 0.0).await.unwrap();
+        let order: Vec<Uuid> = first.iter().map(|h| h.memory_uuid).collect();
+        let order2: Vec<Uuid> = second.iter().map(|h| h.memory_uuid).collect();
+
+        assert_eq!(first.len(), 5, "all tied vectors should be returned");
+        assert_eq!(order, uuids, "ties should be ordered by uuid, got {order:?}");
+        assert_eq!(order, order2, "repeated searches must return the same order");
+        for h in &first {
+            assert!((h.similarity - 1.0).abs() < 1e-4, "tied sim should be ~1.0");
+        }
     }
 
     #[test]
