@@ -325,6 +325,50 @@ mod tests {
         assert_eq!(out.affected_memories, 3);
     }
 
+    #[tokio::test]
+    async fn forget_filter_respects_metadata_match() {
+        let svc = temp_svc().await;
+        let keep = svc
+            .remember(RememberInput {
+                content: "keep me",
+                importance: 0.1,
+                metadata: Some(&serde_json::json!({"env": "dev"})),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let drop = svc
+            .remember(RememberInput {
+                content: "drop me",
+                importance: 0.1,
+                metadata: Some(&serde_json::json!({"env": "prod"})),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let f = MemoryFilter {
+            metadata_match: Some(vec![("env".to_string(), serde_json::json!("prod"))]),
+            ..Default::default()
+        };
+        let out = svc
+            .forget(ForgetInput {
+                target: ForgetTarget::Filter(f),
+                mode: ForgetMode::Soft,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(out.affected_memories, 1, "only the metadata-matching memory may be forgotten");
+
+        let repo = crate::storage::memory::SqliteMemoryRepository::new();
+        let kept = repo.get_by_uuid(&svc.database, NS, keep.uuid).await.unwrap();
+        assert_eq!(kept.status, MemoryStatus::Active, "non-matching row must survive");
+        let gone = repo.get_by_uuid(&svc.database, NS, drop.uuid).await.unwrap();
+        assert_eq!(gone.status, MemoryStatus::Deleted);
+    }
+
     async fn seed_memory_with_relation(svc: &crate::memory::MemoryService) -> (Uuid, Uuid) {
         let mem = svc
             .remember(RememberInput {
