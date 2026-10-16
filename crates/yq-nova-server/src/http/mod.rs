@@ -70,3 +70,154 @@ pub fn build_router(state: AppState) -> Router {
         .layer(TraceLayer::new_for_http())
         .fallback(fallback_404)
 }
+
+#[cfg(test)]
+mod relations_endpoint_tests {
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use http_body_util::BodyExt;
+    use serde_json::{Value, json};
+    use tower::ServiceExt;
+    use uuid::Uuid;
+    use yq_nova_core::{
+        config::{ServerConfig, StorageConfig},
+        graph::{GraphService, extractor::RegexWikiExtractor},
+        memory::MemoryService,
+        storage::{Database, Migrator},
+    };
+
+    use super::{AppState, build_router};
+
+    async fn make_router() -> axum::Router {
+        let dir = std::env::temp_dir().join(format!(
+            "yq-nova-test-rel-list-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let storage_cfg = StorageConfig {
+            db_path: dir.join("nova.sqlite"),
+            ..Default::default()
+        };
+        let db = Database::open(storage_cfg).await.expect("open db");
+        Migrator::run(&db.pool).await.expect("migrations");
+
+        let embed = yq_nova_core::embedding::MockEmbeddingProvider::new(16);
+        let shared_embed: std::sync::Arc<dyn yq_nova_core::embedding::EmbeddingProvider> =
+            std::sync::Arc::new(embed);
+        let memory = MemoryService::new(db.clone(), shared_embed);
+        let graph =
+            GraphService::with_parts(db.clone(), std::sync::Arc::new(RegexWikiExtractor::new()));
+        let state = AppState::new(ServerConfig::default(), db, memory, graph);
+        build_router(state)
+    }
+
+    async fn send(
+        router: &axum::Router,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        let mut builder = Request::builder().uri(uri).method(method);
+        let request = match body {
+            Some(v) => builder
+                .header("content-type", "application/json")
+                .body(Body::from(v.to_string()))
+                .unwrap(),
+            None => {
+                builder = builder.header("accept", "application/json");
+                builder.body(Body::empty()).unwrap()
+            },
+        };
+        let resp = router.clone().oneshot(request).await.unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+
+    async fn create_entity(router: &axum::Router, name: &str) -> Uuid {
+        let (status, body) =
+            send(router, "POST", "/v1/graph/entities", Some(json!({"name": name, "type": "node"})))
+                .await;
+        assert_eq!(status, StatusCode::OK, "entity upsert failed: {body}");
+        Uuid::parse_str(body["entity"]["uuid"].as_str().expect("entity uuid")).unwrap()
+    }
+
+    async fn link(router: &axum::Router, source: Uuid, target: Uuid) {
+        let (status, body) = send(
+            router,
+            "POST",
+            "/v1/graph/relations",
+            Some(json!({
+                "source_uuid": source.to_string(),
+                "target_uuid": target.to_string(),
+                "predicate": "knows",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "relation upsert failed: {body}");
+    }
+
+    #[tokio::test]
+    async fn relations_endpoint_lists_relations_of_every_entity() {
+        let router = make_router().await;
+        let target = create_entity(&router, "Target").await;
+
+        // more sources than any single page of entities, so a handler that
+        // walks entities and stops after the first page loses some of them
+        const SOURCES: usize = 55;
+        for i in 0..SOURCES {
+            let source = create_entity(&router, &format!("Source{i:03}")).await;
+            link(&router, source, target).await;
+        }
+
+        let (status, body) = send(&router, "GET", "/v1/graph/relations?limit=500", None).await;
+        assert_eq!(status, StatusCode::OK, "listing failed: {body}");
+        let listed = body.as_array().expect("array of relations");
+        assert_eq!(listed.len(), SOURCES, "every relation must be listed");
+
+        // pages are disjoint and continue where the previous one stopped
+        let (_, first_page) = send(&router, "GET", "/v1/graph/relations?limit=10", None).await;
+        let (_, second_page) =
+            send(&router, "GET", "/v1/graph/relations?limit=10&offset=10", None).await;
+        let ids = |v: &Value| -> Vec<i64> {
+            v.as_array()
+                .expect("array")
+                .iter()
+                .map(|r| r["id"].as_i64().expect("relation id"))
+                .collect()
+        };
+        let (first_ids, second_ids) = (ids(&first_page), ids(&second_page));
+        assert_eq!(first_ids.len(), 10);
+        assert_eq!(second_ids.len(), 10);
+        assert!(
+            first_ids.iter().all(|id| !second_ids.contains(id)),
+            "consecutive pages must not overlap"
+        );
+        assert!(first_ids.iter().min() > second_ids.iter().max(), "rows come back newest first");
+
+        let (_, tail) =
+            send(&router, "GET", &format!("/v1/graph/relations?limit=10&offset={SOURCES}"), None)
+                .await;
+        assert!(tail.as_array().expect("array").is_empty(), "paging past the end is empty");
+
+        // filtering by source still narrows the result
+        let (_, filtered) = send(
+            &router,
+            "GET",
+            &format!("/v1/graph/relations?source={}&limit=500", Uuid::nil()),
+            None,
+        )
+        .await;
+        assert!(filtered.as_array().expect("array").is_empty());
+
+        // a negative or non-numeric window is rejected while the query string
+        // is parsed, so `list_page` never sees an out-of-range value
+        let (status, _) = send(&router, "GET", "/v1/graph/relations?offset=-1", None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "negative offset must be rejected");
+        let (status, _) = send(&router, "GET", "/v1/graph/relations?limit=nope", None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "non-numeric limit must be rejected");
+    }
+}

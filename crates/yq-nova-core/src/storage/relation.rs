@@ -137,6 +137,77 @@ impl SqliteRelationRepository {
     pub const fn new() -> Self {
         Self
     }
+
+    /// List relations across a whole namespace with SQL-side filtering and
+    /// pagination.
+    ///
+    /// Callers used to walk the namespace's entities and call
+    /// [`RelationRepository::list_outgoing`] once per entity, which dropped
+    /// every relation that belonged to an entity outside the scanned page and
+    /// made `offset` meaningless once that page was exhausted. This applies
+    /// the filters, the ordering and the page window inside SQLite, so every
+    /// relation in the namespace is reachable and consecutive pages never
+    /// overlap or skip rows.
+    ///
+    /// Rows come back newest first (`id` descending). The id is unique, which
+    /// is what keeps `offset` stable between pages when `confidence` ties.
+    ///
+    /// The window is applied by SQLite: `limit` is capped at 10 000 rows and an
+    /// `offset` past the end simply yields an empty page. Negative or
+    /// non-numeric values never reach this method - the HTTP layer deserialises
+    /// them as `usize` and rejects the request with a 400 - so no extra
+    /// validation is required here.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn list_page(
+        &self,
+        db: &Database,
+        namespace_id: i64,
+        source: Option<Uuid>,
+        target: Option<Uuid>,
+        predicate: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> NovaResult<Vec<RelationRecord>> {
+        let predicate = predicate.filter(|p| !p.is_empty());
+
+        let mut where_clauses: Vec<&str> = vec!["namespace_id = ?"];
+        if source.is_some() {
+            where_clauses.push("source_uuid = ?");
+        }
+        if target.is_some() {
+            where_clauses.push("target_uuid = ?");
+        }
+        if predicate.is_some() {
+            where_clauses.push("predicate = ?");
+        }
+
+        let sql = format!(
+            "SELECT id, uuid, source_uuid, target_uuid, predicate, confidence, memory_uuid, \
+             metadata_json, created_at FROM relations WHERE {} ORDER BY id DESC LIMIT ? OFFSET ?",
+            where_clauses.join(" AND ")
+        );
+        let mut q = sqlx::query(&sql).bind(namespace_id);
+        if let Some(s) = source {
+            q = q.bind(s.to_string());
+        }
+        if let Some(t) = target {
+            q = q.bind(t.to_string());
+        }
+        if let Some(p) = predicate {
+            q = q.bind(p);
+        }
+        let rows = q
+            .bind(limit.min(10_000) as i64)
+            .bind(offset as i64)
+            .fetch_all(&db.pool)
+            .await
+            .map_err(NovaError::storage)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            out.push(row_to_relation(&row)?);
+        }
+        Ok(out)
+    }
 }
 
 impl Default for SqliteRelationRepository {
