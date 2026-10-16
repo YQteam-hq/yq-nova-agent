@@ -122,10 +122,14 @@ impl Fts5Store for SqliteFts5Store {
             .await
             .map_err(|e| NovaError::validation_msg(format!("fts5 query invalid ({q:?}): {e}")))?;
 
-        let raw: Vec<(Uuid, f32)> = rows
-            .into_iter()
-            .map(|(u, b)| (Uuid::parse_str(&u).map_err(NovaError::storage).unwrap(), b as f32))
-            .collect();
+        // `memory_items.uuid` is free-form TEXT, so a corrupted or externally
+        // written row can carry a value that is not a UUID. Surface that as a
+        // storage error instead of panicking inside the request handler.
+        let mut raw: Vec<(Uuid, f32)> = Vec::with_capacity(rows.len());
+        for (u, b) in rows {
+            let uuid = Uuid::parse_str(&u).map_err(NovaError::storage)?;
+            raw.push((uuid, b as f32));
+        }
         if raw.is_empty() {
             return Ok(vec![]);
         }
@@ -277,5 +281,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(both.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn fts_malformed_uuid_is_reported_not_panicked() {
+        let (db, _, store) = setup().await;
+        // `memory_items.uuid` is TEXT without a format constraint, so a row
+        // written by an external tool can hold a value that is not a UUID.
+        // The FTS join happily returns it; the store must fail cleanly.
+        sqlx::query(
+            "INSERT INTO memory_items (uuid, content, content_hash, metadata_json, source, \
+             importance, access_count, created_at, status, namespace_id) VALUES (?1, ?2, ?3, ?4, \
+             ?5, ?6, ?7, ?8, ?9, ?10)",
+        )
+        .bind("not-a-valid-uuid")
+        .bind("corrupted row content")
+        .bind("hash-of-corrupted-row")
+        .bind("{}")
+        .bind("agent")
+        .bind(0.5_f64)
+        .bind(0_i64)
+        .bind(chrono::Utc::now().timestamp())
+        .bind("active")
+        .bind(NS)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let err = store
+            .keyword_search(&db, NS, "corrupted", 10, &[MemoryStatus::Active])
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), crate::error::ErrorCode::Storage);
     }
 }
