@@ -6,7 +6,7 @@ use std::{
 use chrono::{DateTime, Utc};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use yq_nova_core::{
     config::ForgettingConfig,
     error::NovaResult,
@@ -70,7 +70,16 @@ pub async fn collect_garbage_once(
     let mut deleted = 0u64;
     let mut offset = 0usize;
     loop {
-        let page = ns_repo.list(&memory.database, 500, offset).await?;
+        let page = match ns_repo.list(&memory.database, 500, offset).await {
+            Ok(page) => page,
+            Err(e) => {
+                // Report which page failed together with the progress made so
+                // far, and let the caller decide: the caller runs this on a
+                // timer, so a bare `?` here would hide how far the cycle got.
+                error!(offset, archived, deleted, error = %e, "gc: listing namespaces failed");
+                return Err(e);
+            },
+        };
         if page.is_empty() {
             break;
         }
@@ -91,6 +100,15 @@ pub async fn collect_garbage_once(
             };
             let out = memory.forget(input).await?;
             let affected = out.affected_memories as u64;
+            if affected > 0 {
+                debug!(
+                    namespace_id = ns.id,
+                    namespace_name = %ns.name,
+                    affected,
+                    mode = ?mode,
+                    "gc: forgetting policy applied to namespace"
+                );
+            }
             match mode {
                 ForgetMode::Archive => archived += affected,
                 ForgetMode::Hard => deleted += affected,
