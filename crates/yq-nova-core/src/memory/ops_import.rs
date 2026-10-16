@@ -514,4 +514,39 @@ mod tests {
             out.errors[0].message
         );
     }
+    #[tokio::test]
+    async fn import_reports_tag_attachment_failures() {
+        let svc = temp_svc().await;
+        // Rename the tag table so attaching tags fails while the memory insert
+        // still succeeds, which is the partial failure this reports.
+        sqlx::query("ALTER TABLE tags RENAME TO tags_hidden")
+            .execute(&svc.database.pool)
+            .await
+            .unwrap();
+
+        let out = import_memories(
+            &svc,
+            ImportInput {
+                namespace_id: crate::storage::namespace::DEFAULT_NAMESPACE_ID,
+                items: vec![ImportItem {
+                    content: "memory whose tags cannot be stored".into(),
+                    tags: Some(vec!["ops".into()]),
+                    ..Default::default()
+                }],
+                embed: false,
+                on_conflict: ConflictStrategy::Skip,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.imported, 1, "the row is still stored");
+        assert_eq!(out.errors.len(), 1, "{:?}", out.errors);
+        assert_eq!(out.errors[0].index, 0);
+        assert!(
+            out.errors[0].message.contains("tagging failed"),
+            "unexpected message: {}",
+            out.errors[0].message
+        );
+    }
 }
