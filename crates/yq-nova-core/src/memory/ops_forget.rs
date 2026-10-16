@@ -325,6 +325,51 @@ mod tests {
         assert_eq!(out.affected_memories, 3);
     }
 
+    #[tokio::test]
+    async fn forget_with_an_empty_tags_all_filter_touches_nothing() {
+        let svc = temp_svc().await;
+        let first = svc
+            .remember(RememberInput {
+                content: "first tagged memory",
+                importance: 0.1,
+                tags: &["kept".to_string()],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let second = svc
+            .remember(RememberInput {
+                content: "second tagged memory",
+                importance: 0.1,
+                tags: &["kept".to_string()],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // `tags_all: []` is rejected by the in-memory filter for every record,
+        // so the SQL layer must not fall back to "no filter at all" and hand a
+        // whole namespace to a destructive forget call.
+        let out = svc
+            .forget(ForgetInput {
+                target: ForgetTarget::Filter(MemoryFilter {
+                    tags_all: Some(Vec::new()),
+                    ..Default::default()
+                }),
+                mode: ForgetMode::Soft,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(out.affected_memories, 0, "an unsatisfiable filter must match nothing");
+
+        let repo = crate::storage::memory::SqliteMemoryRepository::new();
+        for uuid in [first.uuid, second.uuid] {
+            let record = repo.get_by_uuid(&svc.database, NS, uuid).await.unwrap();
+            assert_eq!(record.status, MemoryStatus::Active);
+        }
+    }
+
     async fn seed_memory_with_relation(svc: &crate::memory::MemoryService) -> (Uuid, Uuid) {
         let mem = svc
             .remember(RememberInput {

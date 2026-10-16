@@ -1128,4 +1128,48 @@ mod tests {
             "m2 should be marked as from_graph"
         );
     }
+    #[tokio::test]
+    async fn recall_returns_no_hits_for_an_empty_tags_all_filter() {
+        let svc = temp_svc().await;
+        let stored = svc
+            .remember(RememberInput {
+                content: "entry about rust ownership rules",
+                tags: &["kept".to_string()],
+                importance: 0.5,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let filtered = svc
+            .recall(RecallInput {
+                query: "entry about rust ownership rules",
+                filter: MemoryFilter {
+                    tags_all: Some(Vec::new()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            filtered.hits.is_empty(),
+            "an unsatisfiable tags_all filter must not return hits, got {}",
+            filtered.hits.len()
+        );
+
+        // the same query without the empty filter still finds the memory, so
+        // the assertion above is not vacuous
+        let unfiltered = svc
+            .recall(RecallInput {
+                query: "entry about rust ownership rules",
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            unfiltered.hits.iter().any(|hit| hit.memory.uuid == stored.uuid),
+            "recall without the filter must still return the stored memory"
+        );
+    }
 }

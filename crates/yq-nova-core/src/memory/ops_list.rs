@@ -208,6 +208,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_total_is_zero_for_an_empty_tags_all_filter() {
+        let svc = temp_svc().await;
+        for content in ["first entry", "second entry"] {
+            svc.remember(RememberInput {
+                content,
+                tags: &["kept".to_string()],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+
+        let out = list_memories(
+            &svc,
+            ListInput {
+                filter: MemoryFilter {
+                    tags_all: Some(Vec::new()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.total, 0, "total must not count rows the filter rejects");
+        assert_eq!(out.count, 0);
+        assert!(out.items.is_empty());
+
+        let kept = list_memories(
+            &svc,
+            ListInput {
+                filter: MemoryFilter {
+                    tags_all: Some(vec!["kept".to_string()]),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(kept.total, 2);
+        assert_eq!(kept.count, 2);
+    }
+
+    #[tokio::test]
     async fn list_rejects_invalid_limit() {
         let svc = temp_svc().await;
         let zero = list_memories(

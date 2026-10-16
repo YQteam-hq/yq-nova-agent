@@ -528,7 +528,17 @@ fn build_filter(filter: &MemoryFilter, count_only: bool) -> BuiltQuery {
     }
 
     if let Some(tags) = &filter.tags_all {
-        if !tags.is_empty() {
+        if tags.is_empty() {
+            // `tags_all` requires every listed tag to be present, and the
+            // in-memory `passes_filter` therefore rejects every record when
+            // the list is empty (no record can carry all of zero tags). The
+            // SQL layer used to drop the empty list entirely, which made the
+            // filter a no-op: `count` over-reported and `list`/`forget` acted
+            // on rows the in-memory check would have rejected - an empty
+            // `tags_all` inside a `ForgetTarget::Filter` could wipe a whole
+            // namespace. Emit a contradiction so both layers agree.
+            where_clauses.push("0 = 1".into());
+        } else {
             for t in tags {
                 join_binds.push(BindValue::Text(t.clone()));
             }
@@ -1005,5 +1015,39 @@ mod tests {
         };
         assert_eq!(repo.count(&db, &f2).await.unwrap(), 0);
         assert_eq!(repo.list(&db, &f2, 100, 0).await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn empty_tags_all_matches_nothing_in_sql() {
+        let db = temp_db().await;
+        let repo = SqliteMemoryRepository::new();
+        for (name, tag) in [("a", "alpha"), ("b", "beta")] {
+            repo.insert(
+                &db,
+                InsertMemoryInput {
+                    content: name,
+                    tags: &[tag.to_string()],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        // an empty `tags_all` is unsatisfiable - `passes_filter` rejects every
+        // record - so the SQL layer must not treat it as "no filter at all"
+        let f = MemoryFilter {
+            tags_all: Some(Vec::new()),
+            ..Default::default()
+        };
+        assert_eq!(repo.count(&db, &f).await.unwrap(), 0);
+        assert!(repo.list(&db, &f, 100, 0).await.unwrap().is_empty());
+
+        // the list is only unsatisfiable while it stays empty
+        let f_one = MemoryFilter {
+            tags_all: Some(vec!["alpha".to_string()]),
+            ..Default::default()
+        };
+        assert_eq!(repo.count(&db, &f_one).await.unwrap(), 1);
     }
 }
