@@ -1,5 +1,9 @@
 edition = "2021"
-version = "Two"
+# Recent nightly rustfmt deprecates the `version` option in favour of
+# `style_edition`. Keeping the newer key avoids the deprecation warning on
+# every CI run while preserving the "Two"-era formatting the workspace was
+# written with (the edition itself stays 2021 so stable builds are unaffected).
+style_edition = "2024"
 wrap_comments = true
 format_code_in_doc_comments = true
 format_strings = true
