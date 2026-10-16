@@ -131,11 +131,15 @@ pub async fn recall(
     Json(req): Json<RecallRequest>,
 ) -> Result<Json<RecallOutput>> {
     let svc: &MemoryService = &state.memory;
-    // The namespace is always the one this request is scoped to: the
-    // namespace bound to the API key, or the one selected by the
-    // `x-namespace` header. A body-supplied `namespace_id` must never
-    // override it, otherwise a tenant-scoped key could recall memories
-    // belonging to another tenant by setting `filter.namespace_id`.
+    // Security invariant: the effective namespace is always the one this
+    // request is scoped to - the namespace bound to the API key, or the one
+    // selected by the `x-namespace` header. `filter.namespace_id` arrives in
+    // the request body, so it is untrusted client input and is overwritten
+    // unconditionally rather than merged. Honouring it (or only defaulting it
+    // when it is `None`, which is what this replaced) lets a tenant-scoped key
+    // read another tenant's memories with
+    // `{"filter": {"namespace_id": <other tenant>}}`, so the assignment below
+    // is the isolation boundary and must not become conditional again.
     let mut filter = req.filter.clone();
     filter.namespace_id = Some(ns.id);
     let input = RecallInput {
@@ -164,10 +168,10 @@ pub async fn list_memories(
 ) -> Result<Json<ListOutput>> {
     let svc: &MemoryService = &state.memory;
     let mut req = req;
-    // Same rule as `recall`: the effective namespace comes from the API key
-    // or the `x-namespace` header, never from the request body. A
-    // body-supplied `namespace_id` would let a tenant-scoped key list
-    // another tenant's memories.
+    // Same security invariant as `recall`: the effective namespace comes from
+    // the API key or the `x-namespace` header, never from the request body.
+    // Trusting `filter.namespace_id` here would let a tenant-scoped key
+    // enumerate another tenant's memories, so the client value is replaced.
     req.filter.namespace_id = Some(ns.id);
     let out = svc.list_memories(req).await?;
     Ok(Json(out))
@@ -272,6 +276,9 @@ pub async fn export_memories(
     let svc: &MemoryService = &state.memory;
     let mut req = req;
     let mut filter = req.filter.take().unwrap_or_else(yq_nova_core::storage::MemoryFilter::default);
+    // An export hands out full records, so it applies the same namespace
+    // invariant as `recall` and `list_memories`: a body-supplied
+    // `namespace_id` must never widen the scope of the dump.
     filter.namespace_id = Some(ns.id);
     req.filter = Some(filter);
     let out = svc.export(req).await?;
