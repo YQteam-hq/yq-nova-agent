@@ -166,35 +166,54 @@ pub async fn import_memories(svc: &MemoryService, input: ImportInput) -> NovaRes
         match result {
             Ok(_) => {
                 if !tags.is_empty() {
-                    let _ = crate::storage::memory::attach_tags(
+                    if let Err(e) = crate::storage::memory::attach_tags(
                         &svc.database.pool,
                         ns,
                         insert_uuid,
                         &tags,
                     )
-                    .await;
+                    .await
+                    {
+                        // The row is stored, but without its tags. Report the
+                        // partial failure instead of dropping it: callers that
+                        // filter by tag would otherwise never learn why their
+                        // imported memories are invisible.
+                        errors.push(ImportError {
+                            index: i,
+                            message: format!("inserted but tagging failed: {e}"),
+                        });
+                    }
                 }
                 if input.embed {
                     let meta = svc.embedding.meta();
                     match svc.embedding.embed_one(&content).await {
                         Ok(vec) => {
-                            if vec.len() == meta.dims {
-                                let _ = svc
-                                    .vector_store
-                                    .insert_vector(
-                                        ns,
-                                        insert_uuid,
-                                        &meta.provider,
-                                        &meta.model,
-                                        &vec,
-                                    )
-                                    .await;
+                            if vec.len() != meta.dims {
+                                errors.push(ImportError {
+                                    index: i,
+                                    message: format!(
+                                        "inserted but not embedded: provider {} returned {} dims, \
+                                         expected {}",
+                                        meta.provider,
+                                        vec.len(),
+                                        meta.dims
+                                    ),
+                                });
+                            } else if let Err(e) = svc
+                                .vector_store
+                                .insert_vector(ns, insert_uuid, &meta.provider, &meta.model, &vec)
+                                .await
+                            {
+                                errors.push(ImportError {
+                                    index: i,
+                                    message: format!("inserted but vector storage failed: {e}"),
+                                });
                             }
                         },
                         Err(e) => {
                             errors.push(ImportError {
                                 index: i,
-                                message: format!("embedding failed: {e}"),
+                                message: format!("inserted but embedding failed: {e}"),
                             });
                         },
                     }
@@ -387,5 +406,147 @@ mod tests {
         assert_eq!(out.imported, 2);
         assert_eq!(out.duplicates, 0);
         assert_eq!(out.errors.len(), 2);
+    }
+
+    /// Reports `dims` in its metadata but returns vectors of a different
+    /// length, which is what a misconfigured or mismatched provider does.
+    #[derive(Debug)]
+    struct MismatchedEmbedding {
+        meta: crate::embedding::EmbeddingMeta,
+        produced: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::embedding::EmbeddingProvider for MismatchedEmbedding {
+        fn meta(&self) -> &crate::embedding::EmbeddingMeta {
+            &self.meta
+        }
+
+        async fn embed_batch(&self, texts: &[&str]) -> crate::error::NovaResult<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![0.0f32; self.produced]).collect())
+        }
+    }
+
+    fn svc_with_embedding(
+        db: Database,
+        provider: &str,
+        dims: usize,
+        produced: usize,
+    ) -> crate::memory::MemoryService {
+        let shared: crate::embedding::SharedEmbeddingProvider =
+            std::sync::Arc::new(MismatchedEmbedding {
+                meta: crate::embedding::EmbeddingMeta {
+                    provider: provider.to_string(),
+                    model: format!("test-{dims}d"),
+                    dims,
+                },
+                produced,
+            });
+        crate::memory::MemoryService::new(db, shared)
+    }
+
+    async fn temp_db() -> Database {
+        let dir = std::env::temp_dir().join(format!("yq-nova-import-emb-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = StorageConfig {
+            db_path: dir.join("test.db"),
+            pool_max_connections: 2,
+            pool_min_connections: 0,
+            ..StorageConfig::default()
+        };
+        Database::open(cfg).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn import_reports_embedding_dimension_mismatch() {
+        let svc = svc_with_embedding(temp_db().await, "mismatched", 8, 4);
+        let out = import_memories(
+            &svc,
+            ImportInput {
+                namespace_id: crate::storage::namespace::DEFAULT_NAMESPACE_ID,
+                items: vec![ImportItem {
+                    content: "memory whose embedding is the wrong size".into(),
+                    ..Default::default()
+                }],
+                embed: true,
+                on_conflict: ConflictStrategy::Skip,
+            },
+        )
+        .await
+        .unwrap();
+
+        // the row is stored, so it still counts as imported, but the caller
+        // must learn that it was never embedded
+        assert_eq!(out.imported, 1);
+        assert_eq!(out.errors.len(), 1, "{:?}", out.errors);
+        assert_eq!(out.errors[0].index, 0);
+        assert!(
+            out.errors[0].message.contains("not embedded"),
+            "unexpected message: {}",
+            out.errors[0].message
+        );
+    }
+
+    #[tokio::test]
+    async fn import_reports_vector_store_failures() {
+        // a provider without a name is rejected by the vector store
+        let svc = svc_with_embedding(temp_db().await, "", 4, 4);
+        let out = import_memories(
+            &svc,
+            ImportInput {
+                namespace_id: crate::storage::namespace::DEFAULT_NAMESPACE_ID,
+                items: vec![ImportItem {
+                    content: "memory the vector store refuses".into(),
+                    ..Default::default()
+                }],
+                embed: true,
+                on_conflict: ConflictStrategy::Skip,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.imported, 1);
+        assert_eq!(out.errors.len(), 1, "{:?}", out.errors);
+        assert!(
+            out.errors[0].message.contains("vector storage failed"),
+            "unexpected message: {}",
+            out.errors[0].message
+        );
+    }
+    #[tokio::test]
+    async fn import_reports_tag_attachment_failures() {
+        let svc = temp_svc().await;
+        // Rename the tag table so attaching tags fails while the memory insert
+        // still succeeds, which is the partial failure this reports.
+        sqlx::query("ALTER TABLE tags RENAME TO tags_hidden")
+            .execute(&svc.database.pool)
+            .await
+            .unwrap();
+
+        let out = import_memories(
+            &svc,
+            ImportInput {
+                namespace_id: crate::storage::namespace::DEFAULT_NAMESPACE_ID,
+                items: vec![ImportItem {
+                    content: "memory whose tags cannot be stored".into(),
+                    tags: Some(vec!["ops".into()]),
+                    ..Default::default()
+                }],
+                embed: false,
+                on_conflict: ConflictStrategy::Skip,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.imported, 1, "the row is still stored");
+        assert_eq!(out.errors.len(), 1, "{:?}", out.errors);
+        assert_eq!(out.errors[0].index, 0);
+        assert!(
+            out.errors[0].message.contains("tagging failed"),
+            "unexpected message: {}",
+            out.errors[0].message
+        );
     }
 }
