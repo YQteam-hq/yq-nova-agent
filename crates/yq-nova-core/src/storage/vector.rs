@@ -549,10 +549,8 @@ mod tests {
 
         // a NaN vector cannot be stored, which is what keeps similarities
         // finite and NaN out of the ordering below
-        let rejected = store
-            .insert_vector(NS, uuids[0], "t", "m", &[f32::NAN, 0.0, 0.0])
-            .await
-            .unwrap_err();
+        let rejected =
+            store.insert_vector(NS, uuids[0], "t", "m", &[f32::NAN, 0.0, 0.0]).await.unwrap_err();
         assert_eq!(rejected.code(), crate::error::ErrorCode::Validation);
 
         let hits = store.knn_search(NS, &[1.0f32, 0.0, 0.0], 10, 0.0).await.unwrap();
