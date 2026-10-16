@@ -56,6 +56,7 @@ jobs:
             const baseBranch = process.env.BASE_BRANCH || (pr && pr.base && pr.base.ref) || "";
             const DASH = "\u2014\u2014";
             const shot = (pr && pr.head && pr.head.sha ? pr.head.sha : "").slice(0, 7);
+            const PM_LOGIN = "yq-pm-junior[bot]";
 
             function footer() {
               let s = "\n\n" + DASH + "YQTEAM BOT (pm)";
@@ -80,6 +81,20 @@ jobs:
               return;
             }
 
+            if (pr.merged || pr.state === "closed") {
+              core.info("Pull request is already closed or merged. Nothing to do.");
+              return;
+            }
+
+            // A review submitted by the PM itself also fires pull_request_review.
+            // Ignore it, otherwise the PM would approve, get re-triggered by its
+            // own review and loop until the run limit is hit.
+            if (context.eventName === "pull_request_review" && context.payload.review &&
+                context.payload.review.user && context.payload.review.user.login === PM_LOGIN) {
+              core.info("Triggered by the PM's own review; skipping to avoid a loop.");
+              return;
+            }
+
             // Collect the latest review state per reviewer bot.
             const reviews = await github.paginate(github.rest.pulls.listReviews, {
               owner, repo, pull_number: pr.number, per_page: 100,
@@ -91,6 +106,11 @@ jobs:
               latest[login] = r.state;
             }
             const notApproved = REVIEWERS.filter((x) => latest[x] !== "APPROVED");
+
+            // The PM might run several times for the same commit (once per
+            // reviewer). Only the first successful pass needs to record a review.
+            const pmApprovedThisCommit = reviews.some((r) =>
+              r.user && r.user.login === PM_LOGIN && r.state === "APPROVED" && r.commit_id === pr.head.sha);
 
             if (notApproved.length > 0) {
               core.info("Waiting on reviewers: " + notApproved.join(", "));
@@ -195,7 +215,9 @@ jobs:
             }
 
             try {
-              await github.rest.pulls.createReview({ owner, repo, pull_number: pr.number, event: "APPROVE", body: "PM approved for commit " + shot + ". All five reviewers approved; merging automatically." });
+              if (!pmApprovedThisCommit) {
+                await github.rest.pulls.createReview({ owner, repo, pull_number: pr.number, event: "APPROVE", body: "PM approved for commit " + shot + ". All five reviewers approved; merging automatically." });
+              }
             } catch (e) { core.warning("Could not submit PM review: " + e.message); }
 
             try {
