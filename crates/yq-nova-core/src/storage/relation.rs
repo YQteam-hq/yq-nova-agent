@@ -151,6 +151,12 @@ impl SqliteRelationRepository {
     ///
     /// Rows come back newest first (`id` descending). The id is unique, which
     /// is what keeps `offset` stable between pages when `confidence` ties.
+    ///
+    /// The window is applied by SQLite: `limit` is capped at 10 000 rows and an
+    /// `offset` past the end simply yields an empty page. Negative or
+    /// non-numeric values never reach this method - the HTTP layer deserialises
+    /// them as `usize` and rejects the request with a 400 - so no extra
+    /// validation is required here.
     #[allow(clippy::too_many_arguments)]
     pub async fn list_page(
         &self,

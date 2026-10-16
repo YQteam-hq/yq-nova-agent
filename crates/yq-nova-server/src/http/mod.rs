@@ -212,5 +212,12 @@ mod relations_endpoint_tests {
         )
         .await;
         assert!(filtered.as_array().expect("array").is_empty());
+
+        // a negative or non-numeric window is rejected while the query string
+        // is parsed, so `list_page` never sees an out-of-range value
+        let (status, _) = send(&router, "GET", "/v1/graph/relations?offset=-1", None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "negative offset must be rejected");
+        let (status, _) = send(&router, "GET", "/v1/graph/relations?limit=nope", None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "non-numeric limit must be rejected");
     }
 }
