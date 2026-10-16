@@ -76,6 +76,43 @@ const client = new NovaClient("http://127.0.0.1:7999", {
 | `upsertRelation()` | `POST /v1/graph/relations` |
 | `listRelations()` | `GET /v1/graph/relations` |
 | `traverse()` | `POST /v1/graph/traverse` |
+| `listNamespaces()` | `GET /v1/namespaces` |
+| `getNamespace()` | `GET /v1/namespaces/:name` |
+| `createNamespace()` | `POST /v1/namespaces` |
+| `updateNamespace()` | `PATCH /v1/namespaces/:name` |
+| `deleteNamespace()` | `DELETE /v1/namespaces/:name` |
+
+## Multi-tenant namespaces
+
+Since 0.4.0 every memory, tag, entity and relation is scoped to a namespace, and
+the server falls back to the `default` namespace when no `x-namespace` header is
+sent. Pass one to target a tenant:
+
+```ts
+const client = new NovaClient("http://127.0.0.1:7999", {
+  apiKey: "<tenant-key>",
+  namespace: "team-a",
+});
+
+// Every request from this client now carries `x-namespace: team-a`.
+await client.remember({ content: "tenant scoped memory" });
+
+// Point the same client at another tenant.
+client.withNamespace("team-b");
+client.namespace; // "team-b"
+```
+
+Namespace administration needs an admin client (the global `auth_token`):
+
+```ts
+await client.listNamespaces({ limit: 100 });
+await client.getNamespace("team-a");
+await client.createNamespace({ name: "team-c", description: "third tenant" });
+await client.updateNamespace("team-c", { description: "renamed" });
+await client.deleteNamespace("team-c");
+```
+
+A namespace must be non-empty when provided, and `default` is reserved.
 
 ## Errors
 

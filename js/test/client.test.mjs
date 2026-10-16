@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { NovaClient, NovaApiError } from "../dist/index.js";
 
-function recordClient(opts = {}) {
+function recordClient(opts = {}, clientOptions = {}) {
   const calls = [];
   const stubFetch = async (url, init) => {
     calls.push({ url, init });
@@ -19,6 +19,7 @@ function recordClient(opts = {}) {
   const client = new NovaClient("http://127.0.0.1:7999", {
     apiKey: "k",
     fetch: stubFetch,
+    ...clientOptions,
   });
   return { client, calls };
 }
@@ -97,4 +98,73 @@ test("non-2xx responses throw NovaApiError", async () => {
 
 test("empty base url is rejected", () => {
   assert.throws(() => new NovaClient(""), /must not be empty/);
+});
+
+test("namespace option adds the x-namespace header", async () => {
+  const { client, calls } = recordClient({}, { namespace: "team-a" });
+  assert.equal(client.namespace, "team-a");
+  await client.health();
+  assert.equal(calls[0].init.headers["x-namespace"], "team-a");
+  assert.equal(calls[0].init.headers["Authorization"], "Bearer k");
+});
+
+test("no x-namespace header is sent by default", async () => {
+  const { client, calls } = recordClient();
+  await client.health();
+  assert.equal(client.namespace, undefined);
+  assert.equal(calls[0].init.headers["x-namespace"], undefined);
+});
+
+test("withNamespace switches tenant and is chainable", async () => {
+  const { client, calls } = recordClient();
+  const returned = client.withNamespace("team-b");
+  assert.equal(returned, client);
+  await client.health();
+  assert.equal(calls[0].init.headers["x-namespace"], "team-b");
+});
+
+test("namespace names are trimmed", async () => {
+  const { client, calls } = recordClient({}, { namespace: "  team-a  " });
+  await client.health();
+  assert.equal(calls[0].init.headers["x-namespace"], "team-a");
+});
+
+test("namespace endpoints hit the documented paths", async () => {
+  const { client, calls } = recordClient({}, { namespace: "team-a" });
+
+  await client.listNamespaces({ limit: 5, offset: 2 });
+  await client.getNamespace("team/a");
+  await client.createNamespace({ name: "team-c", description: "third" });
+  await client.updateNamespace("team-c", { description: "renamed" });
+  await client.deleteNamespace("team-c");
+
+  assert.equal(calls[0].url, "http://127.0.0.1:7999/v1/namespaces?limit=5&offset=2");
+  assert.equal(calls[1].url, "http://127.0.0.1:7999/v1/namespaces/team%2Fa");
+  assert.equal(calls[2].url, "http://127.0.0.1:7999/v1/namespaces");
+  assert.deepEqual(JSON.parse(calls[2].init.body), {
+    name: "team-c",
+    description: "third",
+    config: {},
+  });
+  assert.equal(calls[3].url, "http://127.0.0.1:7999/v1/namespaces/team-c");
+  assert.deepEqual(JSON.parse(calls[3].init.body), { description: "renamed" });
+  assert.equal(calls[4].url, "http://127.0.0.1:7999/v1/namespaces/team-c");
+  assert.equal(calls[4].init.method, "DELETE");
+  for (const call of calls) {
+    assert.equal(call.init.headers["x-namespace"], "team-a");
+  }
+});
+
+test("namespace validation", () => {
+  assert.throws(() => new NovaClient("http://127.0.0.1:7999", { namespace: "" }), /non-empty/);
+  assert.throws(
+    () => new NovaClient("http://127.0.0.1:7999").withNamespace("   "),
+    /non-empty/,
+  );
+  const client = new NovaClient("http://127.0.0.1:7999");
+  assert.throws(() => client.getNamespace(""), /non-empty/);
+  assert.throws(() => client.createNamespace({ name: "" }), /non-empty/);
+  assert.throws(() => client.createNamespace({ name: "Default" }), /reserved/);
+  assert.throws(() => client.updateNamespace(" ", {}), /non-empty/);
+  assert.throws(() => client.deleteNamespace(""), /non-empty/);
 });
