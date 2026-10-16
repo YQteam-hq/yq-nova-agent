@@ -220,9 +220,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retry_inverted_sleep_bounds_does_not_panic() {
-        // base_sleep > max_sleep: the backoff cap is below the floor, which
-        // used to trip an assert inside the jitter sampler.
+    async fn retry_with_inverted_sleep_bounds_handles_gracefully() {
+        // base_sleep > max_sleep: the backoff cap is below the floor. The
+        // retry loop must clamp it instead of tripping the sampler's assert,
+        // so the call fails with the operation error rather than panicking.
         let cfg = RetryConfig {
             max_attempts: 2,
             base_sleep: Duration::from_millis(5),
