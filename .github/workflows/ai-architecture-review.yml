@@ -1,18 +1,4 @@
-name: "Bot: AI PR Review"
-
-# Reviews a pull request with an AI model, posts a summary comment and
-# submits a pull request review so the bot can also act as an approver.
-# Every literal in this file stays English so the repository language policy
-# is satisfied.
-#
-# Requirement: set a repository (or organization) secret named GLM_API_KEY.
-# Without the secret the job logs a warning and exits successfully.
-#
-# Optional: to publish under the bot's own name (instead of the generic
-# github-actions identity) set the organization variable BOT_APP_ID and the
-# organization secret BOT_APP_PRIVATE_KEY for a GitHub App installed on the
-# repositories. When they are absent the workflow falls back to the default
-# GITHUB_TOKEN.
+name: "Bot: Architecture Review"
 
 on:
   pull_request:
@@ -24,23 +10,21 @@ permissions:
   issues: write
 
 concurrency:
-  group: ai-pr-review-${{ github.event.pull_request.number }}
+  group: ai-architecture-review-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
   review:
-    name: review
+    name: architecture
     if: ${{ github.event.pull_request.draft == false }}
     runs-on: ubuntu-latest
     steps:
       - name: Mint bot token
         id: bot
-        if: ${{ vars.BOT_APP_ID != '' }}
-        continue-on-error: true
         uses: actions/create-github-app-token@v2
         with:
-          app-id: ${{ vars.BOT_APP_ID }}
-          private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
+          app-id: 5342963
+          private-key: ${{ secrets.YQ_APP_KEY_ARCHITECTURE }}
 
       - name: AI review
         uses: actions/github-script@v7
@@ -49,19 +33,25 @@ jobs:
           GLM_MODEL: glm-4.5-flash
           GLM_ENDPOINT: https://open.bigmodel.cn/api/paas/v4/chat/completions
           MAX_CHARS: "14000"
-          ATTEMPTS: "4"
+          ATTEMPTS: "6"
+          STAGGER_SECONDS: "24"
+          ROLE_TITLE: "Architecture"
+          ROLE_FOCUS: "Focus strictly on architecture and design: module boundaries, coupling and cohesion, abstraction leaks, layering violations, API and interface design, extensibility, and consistency with the existing design."
+          MARKER: "<!-- ai-architecture-review -->"
         with:
-          github-token: ${{ steps.bot.outputs.token || github.token }}
+          github-token: ${{ steps.bot.outputs.token }}
           script: |
             const { owner, repo } = context.repo;
             const pr = context.payload.pull_request;
             const key = process.env.GLM_API_KEY;
-            const MARKER = "<!-- ai-pr-review-bot -->";
+            const MARKER = process.env.MARKER;
+            const ROLE_TITLE = process.env.ROLE_TITLE;
+            const ROLE_FOCUS = process.env.ROLE_FOCUS;
             const DASH = "\u2014\u2014";
             const shot = (pr.head && pr.head.sha ? pr.head.sha : "").slice(0, 7);
 
             function footer() {
-              let s = "\n\n" + DASH + "YQTEAM BOT";
+              let s = "\n\n" + DASH + "YQTEAM BOT (architecture)";
               if (shot) s += " | reviewed commit " + shot;
               return s + "\n\n" + MARKER;
             }
@@ -93,42 +83,51 @@ jobs:
             for (const f of files) {
               if (!f.patch) continue;
               if (skipRe.test(f.filename)) continue;
-              const chunk = `### ${f.filename} (${f.status}, +${f.additions}/-${f.deletions})\n\`\`\`diff\n${f.patch}\n\`\`\`\n`;
+              const chunk = "### " + f.filename + " (" + f.status + ", +" + f.additions + "/-" + f.deletions + ")\n```diff\n" + f.patch + "\n```\n";
               if (chunk.length > budget) { diffText += "\n_(some files skipped: too large)_\n"; break; }
               diffText += chunk;
               budget -= chunk.length;
             }
 
             if (!diffText.trim()) {
-              await upsert("## AI Code Review\n\nThis pull request has no reviewable text changes. Skipped." + footer());
+              await upsert("## " + ROLE_TITLE + " Review\n\nThis pull request has no reviewable text changes. Skipped." + footer());
+              try {
+                await github.rest.pulls.createReview({ owner, repo, pull_number: pr.number, event: "APPROVE", body: "No reviewable text changes for commit " + shot + "." });
+              } catch (e) { core.warning("Could not submit review: " + e.message); }
               return;
             }
 
             const system = [
-              "You are a senior code reviewer.",
+              "You are the " + ROLE_TITLE + " reviewer of an automated multi-agent review team.",
               "Review this Pull Request.",
-              "Focus on: 1) correctness and potential bugs; 2) edge cases and error handling;",
-              "3) security and performance; 4) readability and maintainability.",
-              "Give concrete, actionable suggestions and reference file names and key code.",
-              "Mark severe problems with the tag [Severe].",
-              "End with an overall verdict: safe to merge, or fix before merging.",
+              ROLE_FOCUS,
+              "Give concrete, actionable findings and reference file names and key code.",
+              "Mark any severe problem with the tag [Severe].",
+              "End with a clear overall verdict for your role: safe to merge, or fix before merging.",
               "Use Markdown and do not repeat the full diff.",
               "Never mention the name of the model or the vendor that produced this review.",
               "Write the review in English.",
             ].join("\n");
-            const user = `Repo: ${owner}/${repo}\nPR title: ${pr.title}\nPR body: ${(pr.body || "").slice(0, 2000)}\n\nChanges:\n\n${diffText}`;
+            const user = "Repo: " + owner + "/" + repo + "\nPR title: " + pr.title + "\nPR body: " + (pr.body || "").slice(0, 2000) + "\n\nChanges:\n\n" + diffText;
 
             function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
+            // The five reviewers share one model quota. Stagger their first call
+            // so they do not arrive at the same moment.
+            const stagger = Number(process.env.STAGGER_SECONDS || 0);
+            if (stagger > 0) {
+              core.info("Staggering first model call by " + stagger + "s");
+              await sleep(stagger * 1000);
+            }
+
             async function callModel() {
-              const attempts = Number(process.env.ATTEMPTS) || 4;
+              const attempts = Number(process.env.ATTEMPTS) || 6;
               let lastErr;
               for (let i = 0; i < attempts; i++) {
-                if (i > 0) await sleep(2000 * Math.pow(2, i - 1));
                 try {
                   const res = await fetch(process.env.GLM_ENDPOINT, {
                     method: "POST",
-                    headers: { "Content-Type": "application/json", "Authorization": `Bearer ${key}` },
+                    headers: { "Content-Type": "application/json", "Authorization": "Bearer " + key },
                     body: JSON.stringify({
                       model: process.env.GLM_MODEL || "glm-4.5-flash",
                       messages: [
@@ -141,7 +140,9 @@ jobs:
                   });
                   if (!res.ok) {
                     const detail = await res.text();
-                    throw new Error(`API ${res.status}: ${detail.slice(0, 300)}`);
+                    const err = new Error("API " + res.status + ": " + detail.slice(0, 300));
+                    err.rateLimited = res.status === 429 || /(1302|rate limit|too many requests|\u901f\u7387)/i.test(detail);
+                    throw err;
                   }
                   const data = await res.json();
                   const txt = (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || "";
@@ -149,7 +150,14 @@ jobs:
                   return txt;
                 } catch (e) {
                   lastErr = e;
-                  core.warning(`AI review attempt ${i + 1}/${attempts} failed: ${e.message}`);
+                  core.warning("AI review attempt " + (i + 1) + "/" + attempts + " failed: " + e.message);
+                  if (i < attempts - 1) {
+                    const wait = e.rateLimited
+                      ? Math.min(120000, 30000 * Math.pow(2, i))
+                      : 2000 * Math.pow(2, i);
+                    core.warning("Waiting " + Math.round(wait / 1000) + "s before retry");
+                    await sleep(wait);
+                  }
                 }
               }
               throw lastErr;
@@ -160,27 +168,19 @@ jobs:
               review = await callModel();
             } catch (e) {
               core.warning("AI review failed after retries: " + e.message);
-              await upsert(
-                "## AI Code Review\n\n" +
-                "The automated review could not be completed after several attempts.\n\n" +
-                "> " + String(e.message).replace(/\s+/g, " ").slice(0, 300) + "\n\n" +
-                "Push a new commit or re-run the workflow to try again." +
-                footer()
-              );
+              await upsert("## " + ROLE_TITLE + " Review\n\nThe automated review could not be completed after several attempts.\n\n> " + String(e.message).replace(/\s+/g, " ").slice(0, 300) + footer());
               return;
             }
 
-            await upsert("## AI Code Review\n\n" + review.trim() + footer());
+            await upsert("## " + ROLE_TITLE + " Review\n\n" + review.trim() + footer());
 
             const severe = /\[severe\]/i.test(review);
             const event = severe ? "COMMENT" : "APPROVE";
             const note = severe
-              ? "Automated review found issues for commit " + shot + ". See the review comment for details."
-              : "Automated review passed for commit " + shot + ". No blocking issues found.";
+              ? ROLE_TITLE + " review found issues for commit " + shot + ". See the review comment for details."
+              : ROLE_TITLE + " review passed for commit " + shot + ". No blocking issues found.";
             try {
-              await github.rest.pulls.createReview({
-                owner, repo, pull_number: pr.number, event, body: note,
-              });
+              await github.rest.pulls.createReview({ owner, repo, pull_number: pr.number, event, body: note });
               core.info("Submitted pull request review: " + event);
             } catch (e) {
               core.warning("Could not submit review: " + e.message);
