@@ -105,7 +105,7 @@ jobs:
               ROLE_FOCUS,
               "Give concrete, actionable findings and reference file names and key code.",
               "Mark any severe problem with the tag [Severe].",
-              "End with a clear overall verdict for your role: safe to merge, or fix before merging.",
+              "End with a single final line on its own: VERDICT: APPROVE or VERDICT: COMMENT (use COMMENT for anything other than unconditional approval).",
               "Use Markdown. Do not start with a top-level title or heading.",
               "Do not repeat the full diff.",
               "Never mention the name of the model or the vendor that produced this review.",
@@ -181,8 +181,14 @@ jobs:
             // is added by this workflow so the two do not duplicate each other.
             report = report.trim().replace(/^(#{1,6}[^\n]*\n)+/, "").trim();
 
+            // Verdict -> review event. The model ends with a "VERDICT: APPROVE"
+            // or "VERDICT: COMMENT" line. Any objection wording, a [Severe] tag,
+            // or a missing/ambiguous verdict maps to a non-approving COMMENT so
+            // the merge gate fails closed.
+            const v = (report.match(/VERDICT:\s*(\w+)/i) || [])[1] || "";
+            const objection = /(not safe|before merging|should be (removed|addressed|fixed)|do not merge|cannot be merged)/i.test(report);
             const severe = /\[severe\]/i.test(report);
-            const event = severe ? "COMMENT" : "APPROVE";
+            const event = (v.toUpperCase() === "APPROVE" && !severe && !objection) ? "APPROVE" : "COMMENT";
             try {
               await submit(event, "## " + ROLE_TITLE + " Review\n\n" + report + footer());
               core.info("Submitted pull request review: " + event);

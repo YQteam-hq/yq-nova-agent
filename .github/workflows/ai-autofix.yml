@@ -67,7 +67,7 @@ jobs:
           EXTS = {".py",".js",".jsx",".ts",".tsx",".go",".rs",".java",".rb",".php",".c",".h",
                   ".cc",".cpp",".hpp",".cs",".kt",".swift",".sh",".css",".scss",".html",".vue",".svelte"}
           SKIP = {"package-lock.json","yarn.lock","pnpm-lock.yaml","Cargo.lock","go.sum","composer.lock"}
-          SKIP_DIRS = {"node_modules","dist","build","vendor",".git","target","out"}
+          SKIP_DIRS = {"node_modules","dist","build","vendor","third_party",".git","target","out"}
 
           files = subprocess.check_output(["git", "ls-files"], text=True).splitlines()
           cands = []
@@ -134,6 +134,19 @@ jobs:
                   if lines and lines[-1].strip() == "```":
                       lines = lines[:-1]
                   out = "\n".join(lines) + "\n"
+              # The model may echo the wrapper lines it was given in the
+              # prompt back as part of the "file content". Strip them so they
+              # never land in the repository, and skip the file if any remain.
+              if out.strip().startswith("-----BEGIN FILE-----"):
+                  lines = out.splitlines()
+                  while lines and lines[0].strip() == "-----BEGIN FILE-----":
+                      lines = lines[1:]
+                  while lines and lines[-1].strip() == "-----END FILE-----":
+                      lines = lines[:-1]
+                  out = "\n".join(lines) + "\n"
+              if "-----BEGIN FILE-----" in out or "-----END FILE-----" in out:
+                  print(f"[skip] {f}: model echoed file wrapper lines; not applying")
+                  continue
 
               if out.strip() == text.strip():
                   print(f"[ok] {f}: identical")
