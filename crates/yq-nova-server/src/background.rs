@@ -6,12 +6,12 @@ use std::{
 use chrono::{DateTime, Utc};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use yq_nova_core::{
     config::ForgettingConfig,
     error::NovaResult,
     memory::{ForgetInput, ForgetMode, MemoryService, ops_forget},
-    storage::{MemoryFilter, MemoryStatus},
+    storage::{MemoryFilter, MemoryStatus, NamespaceRepository, SqliteNamespaceRepository},
 };
 
 #[derive(Debug, Default, Clone)]
@@ -55,31 +55,68 @@ pub async fn collect_garbage_once(
     }
 
     let stale_before: DateTime<Utc> = Utc::now() - cfg.stale_after;
-    let filter = MemoryFilter {
-        status_in: Some(vec![MemoryStatus::Active]),
-        last_accessed_before: Some(stale_before),
-        importance_max: Some(cfg.stale_importance_threshold),
-        ..Default::default()
-    };
     let mode = if cfg.action.eq_ignore_ascii_case("delete") {
         ForgetMode::Hard
     } else {
         ForgetMode::Archive
     };
-    let input = ForgetInput {
-        namespace_id: yq_nova_core::storage::namespace::DEFAULT_NAMESPACE_ID,
-        target: ops_forget::ForgetTarget::Filter(filter),
-        mode,
-        gc_graph: false,
-        batch_limit: 1000,
-    };
-    let out = memory.forget(input).await?;
-    let affected = out.affected_memories as u64;
-    let (archived, deleted) = match mode {
-        ForgetMode::Archive => (affected, 0),
-        ForgetMode::Hard => (0, affected),
-        ForgetMode::Soft => (0, 0),
-    };
+
+    // The forgetting policy applies to every namespace, not just the
+    // default one: `ForgetInput` is namespace-scoped, so iterating only
+    // the default namespace would silently exempt every tenant created
+    // through the namespace API.
+    let ns_repo = SqliteNamespaceRepository::new();
+    let mut archived = 0u64;
+    let mut deleted = 0u64;
+    let mut offset = 0usize;
+    loop {
+        let page = match ns_repo.list(&memory.database, 500, offset).await {
+            Ok(page) => page,
+            Err(e) => {
+                // Report which page failed together with the progress made so
+                // far, and let the caller decide: the caller runs this on a
+                // timer, so a bare `?` here would hide how far the cycle got.
+                error!(offset, archived, deleted, error = %e, "gc: listing namespaces failed");
+                return Err(e);
+            },
+        };
+        if page.is_empty() {
+            break;
+        }
+        offset += page.len();
+        for ns in &page {
+            let filter = MemoryFilter {
+                status_in: Some(vec![MemoryStatus::Active]),
+                last_accessed_before: Some(stale_before),
+                importance_max: Some(cfg.stale_importance_threshold),
+                ..Default::default()
+            };
+            let input = ForgetInput {
+                namespace_id: ns.id,
+                target: ops_forget::ForgetTarget::Filter(filter),
+                mode,
+                gc_graph: false,
+                batch_limit: 1000,
+            };
+            let out = memory.forget(input).await?;
+            let affected = out.affected_memories as u64;
+            if affected > 0 {
+                debug!(
+                    namespace_id = ns.id,
+                    namespace_name = %ns.name,
+                    affected,
+                    mode = ?mode,
+                    "gc: forgetting policy applied to namespace"
+                );
+            }
+            match mode {
+                ForgetMode::Archive => archived += affected,
+                ForgetMode::Hard => deleted += affected,
+                ForgetMode::Soft => {},
+            }
+        }
+    }
+
     if archived > 0 || deleted > 0 {
         info!(archived, deleted, "gc: applied forgetting policy");
     }
@@ -180,7 +217,10 @@ mod tests {
         config::StorageConfig,
         embedding::MockEmbeddingProvider,
         memory::{RecallInput, RememberInput, SearchMode},
-        storage::{Database, MemoryRepository, MemoryStatus, SqliteMemoryRepository},
+        storage::{
+            Database, MemoryRepository, MemoryStatus, NamespaceRepository, SqliteMemoryRepository,
+            SqliteNamespaceRepository,
+        },
     };
 
     use super::*;
@@ -358,6 +398,57 @@ mod tests {
         };
         let (a, d) = collect_garbage_once(&memory, &cfg).await.unwrap();
         assert_eq!((a, d), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn gc_applies_forgetting_policy_to_every_namespace() {
+        let (db, memory) = setup("gc-other-ns").await;
+
+        let tenant = SqliteNamespaceRepository::new()
+            .create(
+                &db,
+                yq_nova_core::storage::namespace::CreateNamespaceInput {
+                    name: "tenant-gc",
+                    description: None,
+                    config: None,
+                },
+            )
+            .await
+            .expect("create tenant namespace");
+
+        let u = memory
+            .remember(RememberInput {
+                namespace_id: tenant.id,
+                content: "dusty tenant note",
+                importance: 0.1,
+                ..Default::default()
+            })
+            .await
+            .expect("remember tenant note")
+            .uuid;
+
+        sqlx::query("UPDATE memory_items SET last_accessed = ?, created_at = ? WHERE uuid = ?")
+            .bind((Utc::now() - ChronoDur::days(120)).timestamp())
+            .bind((Utc::now() - ChronoDur::days(120)).timestamp())
+            .bind(u.to_string())
+            .execute(&memory.database.pool)
+            .await
+            .unwrap();
+
+        let cfg = ForgettingConfig {
+            enabled: true,
+            stale_after: ChronoDur::days(90).to_std().unwrap(),
+            stale_importance_threshold: 0.3,
+            action: "archive".into(),
+            check_interval: StdDuration::from_secs(1),
+        };
+        let (archived, deleted) = collect_garbage_once(&memory, &cfg).await.unwrap();
+        assert_eq!(archived, 1, "stale tenant memory must be archived");
+        assert_eq!(deleted, 0);
+
+        let repo = SqliteMemoryRepository::new();
+        let rec = repo.get_by_uuid(&db, tenant.id, u).await.unwrap();
+        assert_eq!(rec.status, MemoryStatus::Archived);
     }
 
     #[tokio::test]
