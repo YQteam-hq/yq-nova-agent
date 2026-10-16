@@ -130,8 +130,13 @@ fn chunk_by_char(text: &str, max_chars: usize, overlap_chars: usize) -> Vec<Stri
         // sequence is never split across two chunks.
         let end = floor_char_boundary(text, (start + max_chars).min(len));
         if end <= start {
-            // The character at `start` is wider than `max_chars`; skip past it
-            // so the loop always makes progress.
+            // The cut point could not be moved forward: the single character at
+            // `start` is wider than `max_chars` itself, so flooring it lands
+            // back on `start`. Slicing there would panic, and pushing an empty
+            // chunk would leave `start` unchanged and spin forever, so step
+            // over the character instead. It cannot be represented inside a
+            // `max_chars`-sized chunk, which makes dropping it the only option
+            // that keeps both the byte limit and forward progress.
             start = ceil_char_boundary(text, start + 1);
             continue;
         }
