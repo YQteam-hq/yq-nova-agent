@@ -288,7 +288,7 @@ impl EntityRepository for SqliteEntityRepository {
         let mut where_clauses: Vec<&str> = Vec::new();
         where_clauses.push("namespace_id = ?");
         if name_prefix.is_some() {
-            where_clauses.push("name LIKE ?");
+            where_clauses.push("name LIKE ? ESCAPE '\\'");
         }
         if type_filter.is_some() {
             where_clauses.push("type = ?");
@@ -306,7 +306,7 @@ impl EntityRepository for SqliteEntityRepository {
         );
         let mut q = sqlx::query(&sql).bind(namespace_id);
         if let Some(np) = name_prefix {
-            q = q.bind(format!("{}%", np.replace('%', "\\%")));
+            q = q.bind(format!("{}%", escape_like(np)));
         }
         if let Some(t) = type_filter {
             q = q.bind(t);
@@ -319,6 +319,25 @@ impl EntityRepository for SqliteEntityRepository {
         }
         Ok(out)
     }
+}
+
+/// Escape the `LIKE` metacharacters of a user-supplied string so it is
+/// matched literally.
+///
+/// The caller appends the trailing `%` wildcard and pairs the result with an
+/// explicit `ESCAPE '\'` clause; without both, a prefix such as `100%` would
+/// match every name starting with `100` (and, because a lone backslash has no
+/// special meaning in `LIKE`, the escaped form would instead require a literal
+/// backslash and match nothing).
+fn escape_like(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 fn row_to_entity(row: &sqlx::sqlite::SqliteRow) -> NovaResult<EntityRecord> {
@@ -376,6 +395,10 @@ mod tests {
     use crate::config::StorageConfig;
 
     const NS: i64 = crate::storage::namespace::DEFAULT_NAMESPACE_ID;
+
+    fn names(rows: &[EntityRecord]) -> Vec<&str> {
+        rows.iter().map(|r| r.name.as_str()).collect()
+    }
 
     async fn temp_db() -> Database {
         let dir = std::env::temp_dir().join(format!("yq-nova-m2-ent-{}", Uuid::new_v4()));
@@ -493,6 +516,50 @@ mod tests {
         let list = repo.list(&db, NS, Some("Al"), None, 100, 0).await.unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].name, "Alice");
+    }
+
+    #[tokio::test]
+    async fn list_matches_the_name_prefix_literally() {
+        let db = temp_db().await;
+        let repo = SqliteEntityRepository::new();
+        for n in ["100% cotton", "100X cotton", "report_2024", "reportX2024", "back\\slash"] {
+            repo.upsert(
+                &db,
+                UpsertEntityInput {
+                    namespace_id: NS,
+                    name: n,
+                    r#type: "thing",
+                    description: None,
+                    metadata: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        // `%` inside the prefix must not act as a wildcard
+        let pct = repo.list(&db, NS, Some("100%"), None, 100, 0).await.unwrap();
+        assert_eq!(pct.len(), 1, "% must be matched literally, got {:?}", names(&pct));
+        assert_eq!(pct[0].name, "100% cotton");
+
+        // `_` must not act as a single-character wildcard
+        let underscore = repo.list(&db, NS, Some("report_"), None, 100, 0).await.unwrap();
+        assert_eq!(
+            underscore.len(),
+            1,
+            "_ must be matched literally, got {:?}",
+            names(&underscore)
+        );
+        assert_eq!(underscore[0].name, "report_2024");
+
+        // a trailing backslash is data, not an escape character
+        let backslash = repo.list(&db, NS, Some("back\\"), None, 100, 0).await.unwrap();
+        assert_eq!(backslash.len(), 1, "a backslash must be matched literally");
+        assert_eq!(backslash[0].name, "back\\slash");
+
+        // plain prefixes keep working
+        let plain = repo.list(&db, NS, Some("100"), None, 100, 0).await.unwrap();
+        assert_eq!(plain.len(), 2);
     }
 
     #[tokio::test]
