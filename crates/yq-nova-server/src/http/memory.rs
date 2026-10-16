@@ -131,10 +131,17 @@ pub async fn recall(
     Json(req): Json<RecallRequest>,
 ) -> Result<Json<RecallOutput>> {
     let svc: &MemoryService = &state.memory;
+    // Security invariant: the effective namespace is always the one this
+    // request is scoped to - the namespace bound to the API key, or the one
+    // selected by the `x-namespace` header. `filter.namespace_id` arrives in
+    // the request body, so it is untrusted client input and is overwritten
+    // unconditionally rather than merged. Honouring it (or only defaulting it
+    // when it is `None`, which is what this replaced) lets a tenant-scoped key
+    // read another tenant's memories with
+    // `{"filter": {"namespace_id": <other tenant>}}`, so the assignment below
+    // is the isolation boundary and must not become conditional again.
     let mut filter = req.filter.clone();
-    if filter.namespace_id.is_none() {
-        filter.namespace_id = Some(ns.id);
-    }
+    filter.namespace_id = Some(ns.id);
     let input = RecallInput {
         query: &req.query,
         top_k: req.top_k,
@@ -161,9 +168,11 @@ pub async fn list_memories(
 ) -> Result<Json<ListOutput>> {
     let svc: &MemoryService = &state.memory;
     let mut req = req;
-    if req.filter.namespace_id.is_none() {
-        req.filter.namespace_id = Some(ns.id);
-    }
+    // Same security invariant as `recall`: the effective namespace comes from
+    // the API key or the `x-namespace` header, never from the request body.
+    // Trusting `filter.namespace_id` here would let a tenant-scoped key
+    // enumerate another tenant's memories, so the client value is replaced.
+    req.filter.namespace_id = Some(ns.id);
     let out = svc.list_memories(req).await?;
     Ok(Json(out))
 }
@@ -267,6 +276,9 @@ pub async fn export_memories(
     let svc: &MemoryService = &state.memory;
     let mut req = req;
     let mut filter = req.filter.take().unwrap_or_else(yq_nova_core::storage::MemoryFilter::default);
+    // An export hands out full records, so it applies the same namespace
+    // invariant as `recall` and `list_memories`: a body-supplied
+    // `namespace_id` must never widen the scope of the dump.
     filter.namespace_id = Some(ns.id);
     req.filter = Some(filter);
     let out = svc.export(req).await?;
@@ -297,7 +309,7 @@ mod tests {
         config::StorageConfig,
         graph::extractor::RegexWikiExtractor,
         memory::MemoryService,
-        storage::{Database, Migrator},
+        storage::{Database, Migrator, NamespaceRepository},
     };
 
     use super::*;
@@ -807,5 +819,203 @@ mod tests {
         )
         .await;
         assert_eq!(listed.total, 2);
+    }
+
+    async fn make_tenant_router(
+        namespace_keys: std::collections::BTreeMap<String, String>,
+        seed_namespaces: &[&str],
+    ) -> (axum::Router, Database) {
+        let dir = std::env::temp_dir().join(format!(
+            "yq-nova-test-tenant-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let db_path = dir.join("nova.sqlite");
+        let storage_cfg = StorageConfig {
+            db_path,
+            ..Default::default()
+        };
+        let db = Database::open(storage_cfg.clone()).await.expect("open db");
+        Migrator::run(&db.pool).await.expect("migrations");
+
+        for name in seed_namespaces {
+            yq_nova_core::storage::SqliteNamespaceRepository::new()
+                .create(
+                    &db,
+                    yq_nova_core::storage::namespace::CreateNamespaceInput {
+                        name,
+                        description: None,
+                        config: None,
+                    },
+                )
+                .await
+                .expect("seed namespace");
+        }
+
+        let embed = yq_nova_core::embedding::MockEmbeddingProvider::new(16);
+        let shared_embed: std::sync::Arc<dyn yq_nova_core::embedding::EmbeddingProvider> =
+            std::sync::Arc::new(embed);
+        let memory = MemoryService::new(db.clone(), shared_embed);
+        let graph = yq_nova_core::graph::GraphService::with_parts(
+            db.clone(),
+            std::sync::Arc::new(RegexWikiExtractor::new()),
+        );
+
+        let srv_cfg = yq_nova_core::config::ServerConfig {
+            auth_token: String::new(),
+            namespace_keys,
+            ..Default::default()
+        };
+        let state = AppState::new(srv_cfg, db.clone(), memory, graph);
+        let router = crate::http::build_router(state);
+        (router, db)
+    }
+
+    async fn remember_with_key(router: &axum::Router, key: &str, content: &str) -> RememberOutput {
+        let body = serde_json::json!({
+            "content": content,
+            "importance": 0.5,
+            "embed": true,
+            "extract_graph": false,
+        });
+        let req = Request::builder()
+            .uri("/v1/memory/remember")
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {key}"))
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "remember should return 200");
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice::<RememberOutput>(&bytes).unwrap()
+    }
+
+    async fn recall_with_key(
+        router: &axum::Router,
+        key: &str,
+        body: serde_json::Value,
+    ) -> RecallOutput {
+        let req = Request::builder()
+            .uri("/v1/memory/recall")
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {key}"))
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "recall should return 200");
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice::<RecallOutput>(&bytes).unwrap()
+    }
+
+    async fn list_with_key(
+        router: &axum::Router,
+        key: &str,
+        body: serde_json::Value,
+    ) -> ListOutput {
+        let req = Request::builder()
+            .uri("/v1/memory/list")
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {key}"))
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "list should return 200");
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice::<ListOutput>(&bytes).unwrap()
+    }
+
+    async fn tenant_namespaces() -> std::collections::BTreeMap<String, String> {
+        let mut keys = std::collections::BTreeMap::new();
+        keys.insert("tenant-a".to_string(), "key-a".to_string());
+        keys.insert("tenant-b".to_string(), "key-b".to_string());
+        keys
+    }
+
+    #[tokio::test]
+    async fn recall_cannot_cross_namespaces_via_body_filter() {
+        let (router, db) =
+            make_tenant_router(tenant_namespaces().await, &["tenant-a", "tenant-b"]).await;
+
+        let ns_repo = yq_nova_core::storage::SqliteNamespaceRepository::new();
+        let ns_b = ns_repo
+            .get_by_name(&db, "tenant-b")
+            .await
+            .expect("query namespace")
+            .expect("tenant-b exists");
+
+        let a_mem = remember_with_key(&router, "key-a", "tenant-a confidential roadmap").await;
+        let b_mem = remember_with_key(&router, "key-b", "tenant-b confidential roadmap").await;
+
+        // tenant-a's key asks for tenant-b's namespace through the body
+        // filter. The namespace must stay pinned to tenant-a.
+        let out = recall_with_key(
+            &router,
+            "key-a",
+            serde_json::json!({
+                "query": "roadmap",
+                "top_k": 10,
+                "mode": "keyword",
+                "filter": {"namespace_id": ns_b.id},
+            }),
+        )
+        .await;
+        let ids: Vec<Uuid> = out.hits.iter().map(|h| h.memory.uuid).collect();
+        assert!(
+            ids.contains(&a_mem.uuid),
+            "tenant-a should still recall its own memory, got {ids:?}"
+        );
+        assert!(
+            !ids.contains(&b_mem.uuid),
+            "tenant-a key must not recall tenant-b memory via filter.namespace_id, got {ids:?}"
+        );
+
+        // The seeded tenant-b memory is reachable with tenant-b's own key,
+        // so the assertion above cannot pass vacuously.
+        let out_b = recall_with_key(
+            &router,
+            "key-b",
+            serde_json::json!({
+                "query": "roadmap",
+                "top_k": 10,
+                "mode": "keyword",
+            }),
+        )
+        .await;
+        assert!(out_b.hits.iter().any(|h| h.memory.uuid == b_mem.uuid));
+    }
+
+    #[tokio::test]
+    async fn list_cannot_cross_namespaces_via_body_filter() {
+        let (router, db) =
+            make_tenant_router(tenant_namespaces().await, &["tenant-a", "tenant-b"]).await;
+
+        let ns_repo = yq_nova_core::storage::SqliteNamespaceRepository::new();
+        let ns_b = ns_repo
+            .get_by_name(&db, "tenant-b")
+            .await
+            .expect("query namespace")
+            .expect("tenant-b exists");
+
+        let a_mem = remember_with_key(&router, "key-a", "tenant-a ledger entry").await;
+        let b_mem = remember_with_key(&router, "key-b", "tenant-b ledger entry").await;
+
+        let out = list_with_key(
+            &router,
+            "key-a",
+            serde_json::json!({
+                "filter": {"namespace_id": ns_b.id},
+                "limit": 10,
+                "offset": 0,
+            }),
+        )
+        .await;
+        assert_eq!(out.total, 1, "only tenant-a's memory may be counted");
+        assert_eq!(out.items.len(), 1);
+        assert_eq!(out.items[0].uuid, a_mem.uuid);
+        assert_ne!(out.items[0].uuid, b_mem.uuid);
     }
 }
