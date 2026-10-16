@@ -28,6 +28,10 @@ pub(crate) mod duration_seconds {
 
 pub const DEFAULT_CONFIG_FILENAME: &str = "yq-nova.toml";
 
+fn join_keys<T>(map: &std::collections::BTreeMap<String, T>) -> String {
+    map.keys().cloned().collect::<Vec<_>>().join(", ")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Config {
@@ -148,6 +152,46 @@ impl Default for EmbeddingConfig {
             baichuan: std::collections::BTreeMap::new(),
             jina: std::collections::BTreeMap::new(),
         }
+    }
+}
+
+impl EmbeddingConfig {
+    /// Checks that `default_provider` names a provider that can actually be
+    /// built: the special `mock` provider (case-insensitive) or a key present
+    /// in one of the provider maps.
+    ///
+    /// Deliberately separate from [`Config::validate`]: commands that never
+    /// build an embedding provider (`config-show`, `check`, `init-db`) must
+    /// keep working on an otherwise-broken config so they stay useful as
+    /// diagnostics. Call this wherever a provider is about to be built.
+    pub fn validate_provider_references(&self) -> NovaResult<()> {
+        let key = self.default_provider.trim();
+        if key.is_empty() {
+            return Err(NovaError::config_msg("embedding.default_provider must be set"));
+        }
+        if key.eq_ignore_ascii_case("mock") {
+            return Ok(());
+        }
+        let known = self.openai_compatible.contains_key(key)
+            || self.fastembed_local.contains_key(key)
+            || self.zhipu.contains_key(key)
+            || self.qwen.contains_key(key)
+            || self.baichuan.contains_key(key)
+            || self.jina.contains_key(key);
+        if !known {
+            return Err(NovaError::config_msg(format!(
+                "embedding.default_provider='{key}' not found. Available keys: openai_compatible \
+                 [{}], zhipu [{}], qwen [{}], baichuan [{}], jina [{}], fastembed_local [{}], \
+                 special 'mock'",
+                join_keys(&self.openai_compatible),
+                join_keys(&self.zhipu),
+                join_keys(&self.qwen),
+                join_keys(&self.baichuan),
+                join_keys(&self.jina),
+                join_keys(&self.fastembed_local),
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -416,7 +460,38 @@ impl Config {
         if self.storage.soft_heap_limit_kb < 0 {
             return Err(NovaError::config_msg("storage.soft_heap_limit_kb must be >= 0"));
         }
+        if self.storage.pool_max_connections == 0 {
+            return Err(NovaError::config_msg("storage.pool_max_connections must be >= 1"));
+        }
+        if self.storage.pool_min_connections > self.storage.pool_max_connections {
+            return Err(NovaError::config_msg(format!(
+                "storage.pool_min_connections ({}) must be <= storage.pool_max_connections ({})",
+                self.storage.pool_min_connections, self.storage.pool_max_connections
+            )));
+        }
+        // 0 keeps the SQLite/library default; any other value must be a legal
+        // page size (power of two between 512 and 65536). A non-conforming
+        // value is silently ignored by `PRAGMA page_size`, so the user would
+        // believe a size is in effect that never was.
+        let page_size = self.storage.page_size;
+        if page_size != 0
+            && (!(512..=65_536).contains(&page_size) || page_size & (page_size - 1) != 0)
+        {
+            return Err(NovaError::config_msg(
+                "storage.page_size must be a power of two between 512 and 65536 (or 0 to keep the \
+                 default)",
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.logging.otel_sample_rate) {
+            return Err(NovaError::config_msg("logging.otel_sample_rate must be in [0, 1]"));
+        }
         Ok(())
+    }
+
+    /// Convenience delegate to
+    /// [`EmbeddingConfig::validate_provider_references`].
+    pub fn validate_provider_references(&self) -> NovaResult<()> {
+        self.embedding.validate_provider_references()
     }
 
     pub fn save_to(&self, path: &std::path::Path) -> NovaResult<()> {
@@ -464,5 +539,72 @@ mod tests {
         let mut cfg = Config::default();
         cfg.forgetting.stale_importance_threshold = 1.5;
         cfg.validate().expect_err("should fail");
+    }
+
+    #[test]
+    fn pool_min_above_max_rejected() {
+        let mut cfg = Config::default();
+        cfg.storage.pool_min_connections = 8;
+        cfg.storage.pool_max_connections = 4;
+        let err = cfg.validate().expect_err("should fail");
+        assert_eq!(err.code(), crate::error::ErrorCode::Config);
+        assert!(err.to_string().contains("pool_min_connections"), "{err}");
+    }
+
+    #[test]
+    fn pool_max_zero_rejected() {
+        let mut cfg = Config::default();
+        cfg.storage.pool_max_connections = 0;
+        cfg.validate().expect_err("should fail");
+    }
+
+    #[test]
+    fn page_size_must_be_power_of_two_in_range() {
+        for good in [0, 512, 4096, 65_536] {
+            let mut cfg = Config::default();
+            cfg.storage.page_size = good;
+            cfg.validate().unwrap_or_else(|e| panic!("page_size {good} should validate: {e}"));
+        }
+        for bad in [1, 1000, 3000, 65_537, -4096] {
+            let mut cfg = Config::default();
+            cfg.storage.page_size = bad;
+            let err = cfg.validate().expect_err("should fail");
+            assert!(err.to_string().contains("page_size"), "{err}");
+        }
+    }
+
+    #[test]
+    fn otel_sample_rate_range_checked() {
+        for good in [0.0, 0.25, 1.0] {
+            let mut cfg = Config::default();
+            cfg.logging.otel_sample_rate = good;
+            cfg.validate().unwrap_or_else(|e| panic!("rate {good} should validate: {e}"));
+        }
+        for bad in [-0.1, 1.5, f32::NAN] {
+            let mut cfg = Config::default();
+            cfg.logging.otel_sample_rate = bad;
+            cfg.validate().expect_err("should fail");
+        }
+    }
+
+    #[test]
+    fn default_provider_must_resolve() {
+        let cfg = Config::default();
+        cfg.validate_provider_references()
+            .expect("default config points at the 'default' openai_compatible key");
+
+        let mut cfg = Config::default();
+        cfg.embedding.default_provider = "mock".into();
+        cfg.validate_provider_references().expect("mock is always available");
+
+        let mut cfg = Config::default();
+        cfg.embedding.default_provider = "MOCK".into();
+        cfg.validate_provider_references().expect("mock match is case-insensitive");
+
+        let mut cfg = Config::default();
+        cfg.embedding.default_provider = "does-not-exist".into();
+        let err = cfg.validate_provider_references().expect_err("should fail");
+        assert!(err.to_string().contains("does-not-exist"), "{err}");
+        assert!(err.to_string().contains("fastembed_local"), "{err}");
     }
 }
