@@ -16,7 +16,7 @@ use yq_nova_core::{
     },
 };
 
-use crate::http::{AppError, AppState, Result, auth::NamespaceContext};
+use crate::http::{AppState, Result, auth::NamespaceContext};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct UpsertEntityRequest {
@@ -195,15 +195,12 @@ pub async fn upsert_relation(
     let outcome = repo.insert(db, input).await?;
     let relation_uuid = outcome.uuid();
 
-    let list = repo.list_outgoing(db, ns.id, req.source_uuid, Some(predicate.as_str()), 50).await?;
-    let relation = list
-        .into_iter()
-        .find(|r| r.target_uuid == req.target_uuid && r.predicate.trim() == predicate)
-        .ok_or_else(|| {
-            AppError::from(yq_nova_core::error::NovaError::internal(
-                "relation was inserted but could not be re-read",
-            ))
-        })?;
+    // Re-read the row this call wrote. Scanning the source entity's outgoing
+    // relations cannot identify it reliably: the scan is capped, so a freshly
+    // inserted low-confidence relation falls outside the window, and when
+    // duplicates share the same source/predicate/target the lookup returns
+    // whichever row sorts first instead of the one just written.
+    let relation = repo.get_by_uuid(db, ns.id, relation_uuid).await?;
 
     let inserted = matches!(outcome, InsertRelationOutcome::Inserted(_));
     let updated = matches!(outcome, InsertRelationOutcome::Updated(_));
@@ -300,4 +297,138 @@ pub async fn merge_entities(
     };
     let out = svc.merge_entities(ns.id, input).await?;
     Ok(Json(out))
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+    use yq_nova_core::{
+        config::{ServerConfig, StorageConfig},
+        graph::{GraphService, extractor::RegexWikiExtractor},
+        memory::MemoryService,
+        storage::{Database, Migrator},
+    };
+
+    use super::*;
+
+    async fn make_router() -> axum::Router {
+        let dir = std::env::temp_dir().join(format!(
+            "yq-nova-test-graph-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let storage_cfg = StorageConfig {
+            db_path: dir.join("nova.sqlite"),
+            ..Default::default()
+        };
+        let db = Database::open(storage_cfg).await.expect("open db");
+        Migrator::run(&db.pool).await.expect("migrations");
+
+        let embed = yq_nova_core::embedding::MockEmbeddingProvider::new(16);
+        let shared_embed: std::sync::Arc<dyn yq_nova_core::embedding::EmbeddingProvider> =
+            std::sync::Arc::new(embed);
+        let memory = MemoryService::new(db.clone(), shared_embed);
+        let graph =
+            GraphService::with_parts(db.clone(), std::sync::Arc::new(RegexWikiExtractor::new()));
+
+        let state = AppState::new(ServerConfig::default(), db, memory, graph);
+        crate::http::build_router(state)
+    }
+
+    async fn post_json(
+        router: &axum::Router,
+        uri: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let req = Request::builder()
+            .uri(uri)
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, value)
+    }
+
+    async fn create_entity(router: &axum::Router, name: &str) -> Uuid {
+        let (status, body) = post_json(
+            router,
+            "/v1/graph/entities",
+            serde_json::json!({"name": name, "type": "test"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "entity upsert failed: {body}");
+        Uuid::parse_str(body["entity"]["uuid"].as_str().expect("entity uuid")).unwrap()
+    }
+
+    async fn upsert_relation(
+        router: &axum::Router,
+        source: Uuid,
+        target: Uuid,
+        predicate: &str,
+        confidence: f32,
+    ) -> (StatusCode, serde_json::Value) {
+        post_json(
+            router,
+            "/v1/graph/relations",
+            serde_json::json!({
+                "source_uuid": source.to_string(),
+                "target_uuid": target.to_string(),
+                "predicate": predicate,
+                "confidence": confidence,
+                "idempotent": false,
+            }),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn upsert_relation_returns_the_row_it_wrote() {
+        let router = make_router().await;
+        let alice = create_entity(&router, "Alice").await;
+        let acme = create_entity(&router, "Acme").await;
+
+        let (status, first) = upsert_relation(&router, alice, acme, "works_at", 1.0).await;
+        assert_eq!(status, StatusCode::OK, "first upsert failed: {first}");
+
+        // a second, non-idempotent write with the same key must still report
+        // the row it created, not the higher-confidence sibling
+        let (status, second) = upsert_relation(&router, alice, acme, "works_at", 0.4).await;
+        assert_eq!(status, StatusCode::OK, "duplicate upsert failed: {second}");
+        assert_eq!(
+            second["relation_uuid"], second["relation"]["uuid"],
+            "the response must describe the row that was written"
+        );
+        assert_ne!(
+            first["relation"]["uuid"], second["relation"]["uuid"],
+            "the second write created a distinct row"
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_relation_survives_many_siblings_with_the_same_predicate() {
+        let router = make_router().await;
+        let alice = create_entity(&router, "Alice").await;
+        let acme = create_entity(&router, "Acme").await;
+
+        for _ in 0..60 {
+            let (status, body) = upsert_relation(&router, alice, acme, "visits", 1.0).await;
+            assert_eq!(status, StatusCode::OK, "sibling upsert failed: {body}");
+        }
+
+        // the new row is the least confident one, so a capped scan of the
+        // source entity's outgoing relations can no longer see it
+        let (status, body) = upsert_relation(&router, alice, acme, "visits", 0.1).await;
+        assert_eq!(status, StatusCode::OK, "low-confidence upsert failed: {body}");
+        assert_eq!(body["relation_uuid"], body["relation"]["uuid"]);
+    }
 }
