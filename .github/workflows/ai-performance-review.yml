@@ -37,39 +37,42 @@ jobs:
           STAGGER_SECONDS: "16"
           ROLE_TITLE: "Performance"
           ROLE_FOCUS: "Focus strictly on performance and scalability: algorithmic complexity, N+1 queries, unnecessary allocations or copies, blocking IO on hot paths, unbounded memory or CPU growth, and inefficient data structures."
-          MARKER: "<!-- ai-performance-review -->"
+          BOT_LOGIN: "yq-performance-review[bot]"
         with:
           github-token: ${{ steps.bot.outputs.token }}
           script: |
             const { owner, repo } = context.repo;
             const pr = context.payload.pull_request;
             const key = process.env.GLM_API_KEY;
-            const MARKER = process.env.MARKER;
+            const BOT_LOGIN = process.env.BOT_LOGIN;
             const ROLE_TITLE = process.env.ROLE_TITLE;
             const ROLE_FOCUS = process.env.ROLE_FOCUS;
             const DASH = "\u2014\u2014";
-            const shot = (pr.head && pr.head.sha ? pr.head.sha : "").slice(0, 7);
+            const headSha = pr.head && pr.head.sha ? pr.head.sha : "";
+            const shot = headSha.slice(0, 7);
 
             function footer() {
               let s = "\n\n" + DASH + "YQTEAM BOT (performance)";
               if (shot) s += " | reviewed commit " + shot;
-              return s + "\n\n" + MARKER;
+              return s;
             }
 
-            async function upsert(body) {
-              const comments = await github.paginate(github.rest.issues.listComments, {
-                owner, repo, issue_number: pr.number, per_page: 100,
-              });
-              const prev = comments.find((c) => c.body && c.body.indexOf(MARKER) >= 0);
-              if (prev) {
-                await github.rest.issues.updateComment({ owner, repo, comment_id: prev.id, body });
-              } else {
-                await github.rest.issues.createComment({ owner, repo, issue_number: pr.number, body });
-              }
+            function submit(event, body) {
+              return github.rest.pulls.createReview({ owner, repo, pull_number: pr.number, event, body });
             }
 
             if (!key) {
               core.warning("Review secret is not set. Skipping AI review.");
+              return;
+            }
+
+            // One review per bot per commit. If this bot already reviewed the
+            // current head commit, do nothing so the timeline stays clean.
+            const prior = await github.paginate(github.rest.pulls.listReviews, {
+              owner, repo, pull_number: pr.number, per_page: 100,
+            });
+            if (prior.some((r) => r.user && r.user.login === BOT_LOGIN && r.commit_id === headSha)) {
+              core.info("Already reviewed commit " + shot + ". Skipping.");
               return;
             }
 
@@ -90,9 +93,8 @@ jobs:
             }
 
             if (!diffText.trim()) {
-              await upsert("## " + ROLE_TITLE + " Review\n\nThis pull request has no reviewable text changes. Skipped." + footer());
               try {
-                await github.rest.pulls.createReview({ owner, repo, pull_number: pr.number, event: "APPROVE", body: "No reviewable text changes for commit " + shot + "." });
+                await submit("APPROVE", "## " + ROLE_TITLE + " Review\n\nThis pull request has no reviewable text changes. Skipped." + footer());
               } catch (e) { core.warning("Could not submit review: " + e.message); }
               return;
             }
@@ -104,7 +106,8 @@ jobs:
               "Give concrete, actionable findings and reference file names and key code.",
               "Mark any severe problem with the tag [Severe].",
               "End with a clear overall verdict for your role: safe to merge, or fix before merging.",
-              "Use Markdown and do not repeat the full diff.",
+              "Use Markdown. Do not start with a top-level title or heading.",
+              "Do not repeat the full diff.",
               "Never mention the name of the model or the vendor that produced this review.",
               "Write the review in English.",
             ].join("\n");
@@ -163,24 +166,25 @@ jobs:
               throw lastErr;
             }
 
-            let review = "";
+            let report = "";
             try {
-              review = await callModel();
+              report = await callModel();
             } catch (e) {
               core.warning("AI review failed after retries: " + e.message);
-              await upsert("## " + ROLE_TITLE + " Review\n\nThe automated review could not be completed after several attempts.\n\n> " + String(e.message).replace(/\s+/g, " ").slice(0, 300) + footer());
+              try {
+                await submit("COMMENT", "## " + ROLE_TITLE + " Review\n\nThe automated review could not be completed after several attempts.\n\n> " + String(e.message).replace(/\s+/g, " ").slice(0, 300) + footer());
+              } catch (e2) { core.warning("Could not submit review: " + e2.message); }
               return;
             }
 
-            await upsert("## " + ROLE_TITLE + " Review\n\n" + review.trim() + footer());
+            // Drop any leading Markdown heading from the model output; the title
+            // is added by this workflow so the two do not duplicate each other.
+            report = report.trim().replace(/^(#{1,6}[^\n]*\n)+/, "").trim();
 
-            const severe = /\[severe\]/i.test(review);
+            const severe = /\[severe\]/i.test(report);
             const event = severe ? "COMMENT" : "APPROVE";
-            const note = severe
-              ? ROLE_TITLE + " review found issues for commit " + shot + ". See the review comment for details."
-              : ROLE_TITLE + " review passed for commit " + shot + ". No blocking issues found.";
             try {
-              await github.rest.pulls.createReview({ owner, repo, pull_number: pr.number, event, body: note });
+              await submit(event, "## " + ROLE_TITLE + " Review\n\n" + report + footer());
               core.info("Submitted pull request review: " + event);
             } catch (e) {
               core.warning("Could not submit review: " + e.message);
