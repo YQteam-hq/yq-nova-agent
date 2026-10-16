@@ -1,0 +1,187 @@
+name: "Bot: Security Review"
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: ai-security-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    name: security
+    if: ${{ github.event.pull_request.draft == false }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mint bot token
+        id: bot
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: 5342950
+          private-key: ${{ secrets.YQ_APP_KEY_SECURITY }}
+
+      - name: AI review
+        uses: actions/github-script@v7
+        env:
+          GLM_API_KEY: ${{ secrets.GLM_API_KEY }}
+          GLM_MODEL: glm-4.5-flash
+          GLM_ENDPOINT: https://open.bigmodel.cn/api/paas/v4/chat/completions
+          MAX_CHARS: "14000"
+          ATTEMPTS: "6"
+          STAGGER_SECONDS: "8"
+          ROLE_TITLE: "Security"
+          ROLE_FOCUS: "Focus strictly on security: injection (SQL/command/path), XSS, SSRF, authentication and authorization flaws, secrets or credentials in code, unsafe deserialization, insecure cryptography, missing input validation, and risky dependencies."
+          MARKER: "<!-- ai-security-review -->"
+        with:
+          github-token: ${{ steps.bot.outputs.token }}
+          script: |
+            const { owner, repo } = context.repo;
+            const pr = context.payload.pull_request;
+            const key = process.env.GLM_API_KEY;
+            const MARKER = process.env.MARKER;
+            const ROLE_TITLE = process.env.ROLE_TITLE;
+            const ROLE_FOCUS = process.env.ROLE_FOCUS;
+            const DASH = "\u2014\u2014";
+            const shot = (pr.head && pr.head.sha ? pr.head.sha : "").slice(0, 7);
+
+            function footer() {
+              let s = "\n\n" + DASH + "YQTEAM BOT (security)";
+              if (shot) s += " | reviewed commit " + shot;
+              return s + "\n\n" + MARKER;
+            }
+
+            async function upsert(body) {
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner, repo, issue_number: pr.number, per_page: 100,
+              });
+              const prev = comments.find((c) => c.body && c.body.indexOf(MARKER) >= 0);
+              if (prev) {
+                await github.rest.issues.updateComment({ owner, repo, comment_id: prev.id, body });
+              } else {
+                await github.rest.issues.createComment({ owner, repo, issue_number: pr.number, body });
+              }
+            }
+
+            if (!key) {
+              core.warning("Review secret is not set. Skipping AI review.");
+              return;
+            }
+
+            const skipRe = /(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|Cargo\.lock|go\.sum|composer\.lock|\.min\.(js|css)$|\.(png|jpg|jpeg|gif|svg|ico|pdf|zip|gz|woff2?|ttf|lock)$)/i;
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner, repo, pull_number: pr.number, per_page: 100,
+            });
+
+            let budget = Number(process.env.MAX_CHARS);
+            let diffText = "";
+            for (const f of files) {
+              if (!f.patch) continue;
+              if (skipRe.test(f.filename)) continue;
+              const chunk = "### " + f.filename + " (" + f.status + ", +" + f.additions + "/-" + f.deletions + ")\n```diff\n" + f.patch + "\n```\n";
+              if (chunk.length > budget) { diffText += "\n_(some files skipped: too large)_\n"; break; }
+              diffText += chunk;
+              budget -= chunk.length;
+            }
+
+            if (!diffText.trim()) {
+              await upsert("## " + ROLE_TITLE + " Review\n\nThis pull request has no reviewable text changes. Skipped." + footer());
+              try {
+                await github.rest.pulls.createReview({ owner, repo, pull_number: pr.number, event: "APPROVE", body: "No reviewable text changes for commit " + shot + "." });
+              } catch (e) { core.warning("Could not submit review: " + e.message); }
+              return;
+            }
+
+            const system = [
+              "You are the " + ROLE_TITLE + " reviewer of an automated multi-agent review team.",
+              "Review this Pull Request.",
+              ROLE_FOCUS,
+              "Give concrete, actionable findings and reference file names and key code.",
+              "Mark any severe problem with the tag [Severe].",
+              "End with a clear overall verdict for your role: safe to merge, or fix before merging.",
+              "Use Markdown and do not repeat the full diff.",
+              "Never mention the name of the model or the vendor that produced this review.",
+              "Write the review in English.",
+            ].join("\n");
+            const user = "Repo: " + owner + "/" + repo + "\nPR title: " + pr.title + "\nPR body: " + (pr.body || "").slice(0, 2000) + "\n\nChanges:\n\n" + diffText;
+
+            function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+            // The five reviewers share one model quota. Stagger their first call
+            // so they do not arrive at the same moment.
+            const stagger = Number(process.env.STAGGER_SECONDS || 0);
+            if (stagger > 0) {
+              core.info("Staggering first model call by " + stagger + "s");
+              await sleep(stagger * 1000);
+            }
+
+            async function callModel() {
+              const attempts = Number(process.env.ATTEMPTS) || 6;
+              let lastErr;
+              for (let i = 0; i < attempts; i++) {
+                try {
+                  const res = await fetch(process.env.GLM_ENDPOINT, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json", "Authorization": "Bearer " + key },
+                    body: JSON.stringify({
+                      model: process.env.GLM_MODEL || "glm-4.5-flash",
+                      messages: [
+                        { role: "system", content: system },
+                        { role: "user", content: user },
+                      ],
+                      temperature: 0.3,
+                      max_tokens: 3000,
+                    }),
+                  });
+                  if (!res.ok) {
+                    const detail = await res.text();
+                    const err = new Error("API " + res.status + ": " + detail.slice(0, 300));
+                    err.rateLimited = res.status === 429 || /(1302|rate limit|too many requests|\u901f\u7387)/i.test(detail);
+                    throw err;
+                  }
+                  const data = await res.json();
+                  const txt = (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || "";
+                  if (!txt.trim()) throw new Error("empty response");
+                  return txt;
+                } catch (e) {
+                  lastErr = e;
+                  core.warning("AI review attempt " + (i + 1) + "/" + attempts + " failed: " + e.message);
+                  if (i < attempts - 1) {
+                    const wait = e.rateLimited
+                      ? Math.min(120000, 30000 * Math.pow(2, i))
+                      : 2000 * Math.pow(2, i);
+                    core.warning("Waiting " + Math.round(wait / 1000) + "s before retry");
+                    await sleep(wait);
+                  }
+                }
+              }
+              throw lastErr;
+            }
+
+            let review = "";
+            try {
+              review = await callModel();
+            } catch (e) {
+              core.warning("AI review failed after retries: " + e.message);
+              await upsert("## " + ROLE_TITLE + " Review\n\nThe automated review could not be completed after several attempts.\n\n> " + String(e.message).replace(/\s+/g, " ").slice(0, 300) + footer());
+              return;
+            }
+
+            await upsert("## " + ROLE_TITLE + " Review\n\n" + review.trim() + footer());
+
+            const severe = /\[severe\]/i.test(review);
+            const event = severe ? "COMMENT" : "APPROVE";
+            const note = severe
+              ? ROLE_TITLE + " review found issues for commit " + shot + ". See the review comment for details."
+              : ROLE_TITLE + " review passed for commit " + shot + ". No blocking issues found.";
+            try {
+              await github.rest.pulls.createReview({ owner, repo, pull_number: pr.number, event, body: note });
+              core.info("Submitted pull request review: " + event);
+            } catch (e) {
+              core.warning("Could not submit review: " + e.message);
+            }

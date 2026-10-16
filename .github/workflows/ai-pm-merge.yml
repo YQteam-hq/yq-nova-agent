@@ -1,0 +1,211 @@
+name: "Bot: PM Gate & Merge"
+
+# Junior PM bot. It reappears whenever a reviewer submits a review, checks that
+# all five specialized reviewers have approved, adds its own verdict, and merges
+# the pull request when nothing is blocking. Every literal stays English so the
+# repository language policy is satisfied.
+
+on:
+  pull_request_review:
+    types: [submitted, dismissed]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: ai-pm-merge-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  pm:
+    name: pm
+    if: ${{ github.event.pull_request.draft == false }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mint PM token
+        id: bot
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: 5343159
+          private-key: ${{ secrets.YQ_APP_KEY_PM }}
+
+      - name: PM gate
+        uses: actions/github-script@v7
+        env:
+          GLM_API_KEY: ${{ secrets.GLM_API_KEY }}
+          GLM_MODEL: glm-4.5-flash
+          GLM_ENDPOINT: https://open.bigmodel.cn/api/paas/v4/chat/completions
+          MAX_CHARS: "14000"
+          ATTEMPTS: "6"
+          MARKER: "<!-- ai-pm-junior -->"
+          REVIEWERS: "yq-correctness-review[bot],yq-security-review[bot],yq-performance-review[bot],yq-architecture-review[bot],yq-maintainability-review[bot]"
+          BASE_BRANCH: ${{ github.event.pull_request.base.ref }}
+        with:
+          github-token: ${{ steps.bot.outputs.token }}
+          script: |
+            const { owner, repo } = context.repo;
+            const pr = context.payload.pull_request;
+            const key = process.env.GLM_API_KEY;
+            const MARKER = process.env.MARKER;
+            const REVIEWERS = process.env.REVIEWERS.split(",").map((s) => s.trim()).filter(Boolean);
+            const baseBranch = process.env.BASE_BRANCH || (pr && pr.base && pr.base.ref) || "";
+            const DASH = "\u2014\u2014";
+            const shot = (pr && pr.head && pr.head.sha ? pr.head.sha : "").slice(0, 7);
+
+            function footer() {
+              let s = "\n\n" + DASH + "YQTEAM BOT (pm)";
+              if (shot) s += " | checked commit " + shot;
+              return s + "\n\n" + MARKER;
+            }
+
+            async function upsert(body) {
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner, repo, issue_number: pr.number, per_page: 100,
+              });
+              const prev = comments.find((c) => c.body && c.body.indexOf(MARKER) >= 0);
+              if (prev) {
+                await github.rest.issues.updateComment({ owner, repo, comment_id: prev.id, body });
+              } else {
+                await github.rest.issues.createComment({ owner, repo, issue_number: pr.number, body });
+              }
+            }
+
+            if (!pr) {
+              core.info("No pull request in event payload. Nothing to do.");
+              return;
+            }
+
+            // Collect the latest review state per reviewer bot.
+            const reviews = await github.paginate(github.rest.pulls.listReviews, {
+              owner, repo, pull_number: pr.number, per_page: 100,
+            });
+            const latest = {};
+            for (const r of reviews) {
+              const login = r.user && r.user.login;
+              if (!login) continue;
+              latest[login] = r.state;
+            }
+            const notApproved = REVIEWERS.filter((x) => latest[x] !== "APPROVED");
+
+            if (notApproved.length > 0) {
+              core.info("Waiting on reviewers: " + notApproved.join(", "));
+              return;
+            }
+
+            // Do not merge a PR that is behind, dirty or unstable.
+            let mergeable = pr.mergeable;
+            let mergeState = pr.mergeable_state;
+            for (let i = 0; i < 5 && (mergeable === null || mergeState === "unknown"); i++) {
+              await new Promise((r) => setTimeout(r, 2000));
+              const fresh = await github.rest.pulls.get({ owner, repo, pull_number: pr.number });
+              mergeable = fresh.data.mergeable;
+              mergeState = fresh.data.mergeable_state;
+            }
+            if (mergeable === false) {
+              await upsert("## PM Gate\n\nAll five reviewers approved, but the pull request cannot be merged automatically: the branch has conflicts. Please resolve them and push again." + footer());
+              return;
+            }
+
+            // The PM's own opinion on the final state.
+            let pmNote;
+            if (!key) {
+              pmNote = "All five reviewers approved. The PM auto-merge gate is enabled; proceeding (the model secret is not set, so no extra PM opinion is recorded).";
+            } else {
+              const skipRe = /(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|Cargo\.lock|go\.sum|composer\.lock|\.min\.(js|css)$|\.(png|jpg|jpeg|gif|svg|ico|pdf|zip|gz|woff2?|ttf|lock)$)/i;
+              const files = await github.paginate(github.rest.pulls.listFiles, {
+                owner, repo, pull_number: pr.number, per_page: 100,
+              });
+              let budget = Number(process.env.MAX_CHARS);
+              let diffText = "";
+              for (const f of files) {
+                if (!f.patch) continue;
+                if (skipRe.test(f.filename)) continue;
+                const chunk = "### " + f.filename + " (" + f.status + ", +" + f.additions + "/-" + f.deletions + ")\n```diff\n" + f.patch + "\n```\n";
+                if (chunk.length > budget) { diffText += "\n_(some files skipped: too large)_\n"; break; }
+                diffText += chunk;
+                budget -= chunk.length;
+              }
+              const system = [
+                "You are the junior project manager of an automated review team.",
+                "Five specialized reviewers (correctness, security, performance, architecture, maintainability) have all approved this Pull Request.",
+                "Confirm whether it is safe to merge into the base branch from a product and integration standpoint.",
+                "Look only for blocking problems that the specialists may have missed: incomplete or half-finished work, obvious regressions, conflicting intent with the PR description, or missing required changes.",
+                "If you find a blocking problem, state it clearly and mark it with the tag [Severe]. Otherwise say it is good to merge.",
+                "Use Markdown, do not repeat the full diff, and keep the answer short.",
+                "Never mention the name of the model or the vendor that produced this review.",
+                "Write the review in English.",
+              ].join("\n");
+              const user = "Repo: " + owner + "/" + repo + "\nBase branch: " + baseBranch + "\nPR title: " + pr.title + "\nPR body: " + (pr.body || "").slice(0, 2000) + "\n\nChanges:\n\n" + (diffText || "_No reviewable text changes._");
+              let verdict = "";
+              let lastErr;
+              const attempts = Number(process.env.ATTEMPTS) || 6;
+              for (let i = 0; i < attempts; i++) {
+                try {
+                  const res = await fetch(process.env.GLM_ENDPOINT, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json", "Authorization": "Bearer " + key },
+                    body: JSON.stringify({
+                      model: process.env.GLM_MODEL || "glm-4.5-flash",
+                      messages: [
+                        { role: "system", content: system },
+                        { role: "user", content: user },
+                      ],
+                      temperature: 0.2,
+                      max_tokens: 1500,
+                    }),
+                  });
+                  if (!res.ok) {
+                    const detail = await res.text();
+                    const err = new Error("API " + res.status + ": " + detail.slice(0, 300));
+                    err.rateLimited = res.status === 429 || /(1302|rate limit|too many requests|\u901f\u7387)/i.test(detail);
+                    throw err;
+                  }
+                  const data = await res.json();
+                  verdict = (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || "";
+                  if (!verdict.trim()) throw new Error("empty response");
+                  break;
+                } catch (e) {
+                  lastErr = e;
+                  verdict = "";
+                  core.warning("PM verdict attempt " + (i + 1) + "/" + attempts + " failed: " + e.message);
+                  if (i < attempts - 1) {
+                    const wait = e.rateLimited ? Math.min(120000, 30000 * Math.pow(2, i)) : 2000 * Math.pow(2, i);
+                    core.warning("Waiting " + Math.round(wait / 1000) + "s before retry");
+                    await new Promise((r) => setTimeout(r, wait));
+                  }
+                }
+              }
+              if (!verdict.trim()) {
+                await upsert("## PM Gate\n\nAll five reviewers approved, but the PM verdict could not be produced after several attempts. Not merging automatically.\n\n> " + String(lastErr && lastErr.message || "unknown error").replace(/\s+/g, " ").slice(0, 300) + footer());
+                return;
+              }
+              if (/\[severe\]/i.test(verdict)) {
+                await upsert("## PM Gate\n\nAll five reviewers approved, but the PM found a remaining blocker. Not merging automatically.\n\n" + verdict.trim() + footer());
+                try {
+                  await github.rest.pulls.createReview({ owner, repo, pull_number: pr.number, event: "COMMENT", body: "PM found a remaining blocker; not merging automatically for commit " + shot + "." });
+                } catch (e) { core.warning("Could not submit review: " + e.message); }
+                return;
+              }
+              pmNote = verdict.trim();
+            }
+
+            try {
+              await github.rest.pulls.createReview({ owner, repo, pull_number: pr.number, event: "APPROVE", body: "PM approved for commit " + shot + ". All five reviewers approved; merging automatically." });
+            } catch (e) { core.warning("Could not submit PM review: " + e.message); }
+
+            try {
+              const res = await github.rest.pulls.merge({
+                owner, repo, pull_number: pr.number, merge_method: "squash",
+                commit_title: pr.title + " (#" + pr.number + ")",
+              });
+              await upsert("## PM Gate\n\nAll five reviewers approved and the PM has no objection. Merged automatically.\n\n" + pmNote + footer());
+              core.info("Merged: " + res.data.sha);
+            } catch (e) {
+              await upsert("## PM Gate\n\nAll five reviewers approved and the PM has no objection, but the automatic merge failed.\n\n> " + String(e.message).replace(/\s+/g, " ").slice(0, 300) + "\n\nThis is usually a branch protection rule or a required check that is still pending." + footer());
+              core.warning("Merge failed: " + e.message);
+            }
