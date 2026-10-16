@@ -28,6 +28,13 @@ pub trait VectorStore: Send + Sync + std::fmt::Debug {
 
     async fn delete_vector(&self, namespace_id: i64, memory_uuid: Uuid) -> NovaResult<()>;
 
+    /// Return up to `k` stored vectors of the namespace whose cosine
+    /// similarity to `query` is at least `threshold`.
+    ///
+    /// Ordering guarantee: hits come back by descending similarity, and equal
+    /// similarities are ordered by memory uuid. The backing query has no
+    /// `ORDER BY`, so callers may rely on this ordering being stable across
+    /// repeated calls for unchanged data.
     async fn knn_search(
         &self,
         namespace_id: i64,
@@ -238,11 +245,22 @@ impl VectorStore for SqliteVectorStore {
         // Break similarity ties on the memory uuid so the result order is
         // deterministic: the input order comes from a SQL query without
         // ORDER BY, which SQLite does not guarantee to be stable.
-        hits.sort_by(|a, b| {
-            b.similarity
+        //
+        // A NaN similarity cannot be ordered by `partial_cmp`, and collapsing
+        // it to `Equal` would also drop the uuid tie-break, so NaN is handled
+        // explicitly as the lowest value and NaN pairs still fall back to the
+        // uuid. The threshold above normally removes such hits already (a
+        // stored vector containing NaN yields NaN, which never compares
+        // greater than a threshold); the comparator stays total regardless.
+        hits.sort_by(|a, b| match (a.similarity.is_nan(), b.similarity.is_nan()) {
+            (true, true) => a.memory_uuid.cmp(&b.memory_uuid),
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            (false, false) => b
+                .similarity
                 .partial_cmp(&a.similarity)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.memory_uuid.cmp(&b.memory_uuid))
+                .then_with(|| a.memory_uuid.cmp(&b.memory_uuid)),
         });
         hits.truncate(k);
         Ok(hits)
@@ -460,5 +478,89 @@ mod tests {
     fn nan_rejected() {
         let err = check_dims(2, &[1.0, f32::NAN]).unwrap_err();
         assert_eq!(err.code(), crate::error::ErrorCode::Validation);
+    }
+    #[tokio::test]
+    async fn knn_orders_by_descending_similarity_before_uuid() {
+        let db = temp_db().await;
+        let mem = SqliteMemoryRepository::new();
+        let store = SqliteVectorStore::with_db(&db, 3);
+        const NS: i64 = crate::storage::namespace::DEFAULT_NAMESPACE_ID;
+
+        let query = [1.0f32, 0.0, 0.0];
+        // vectors whose similarities differ clearly (1.0, ~0.707, 0.0)
+        let rows: Vec<(&str, [f32; 3])> = vec![
+            ("exact", [1.0, 0.0, 0.0]),
+            ("diagonal", [1.0, 1.0, 0.0]),
+            ("orthogonal", [0.0, 1.0, 0.0]),
+        ];
+        for (content, vec) in &rows {
+            let u = mem
+                .insert(
+                    &db,
+                    InsertMemoryInput {
+                        content,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+                .uuid();
+            store.insert_vector(NS, u, "t", "m", vec).await.unwrap();
+        }
+
+        let hits = store.knn_search(NS, &query, 10, 0.0).await.unwrap();
+        let mut contents: Vec<String> = Vec::with_capacity(hits.len());
+        for h in &hits {
+            contents.push(mem.get_by_uuid(&db, NS, h.memory_uuid).await.unwrap().content);
+        }
+        assert_eq!(
+            contents,
+            vec!["exact".to_string(), "diagonal".to_string(), "orthogonal".to_string()],
+            "differing similarities must drive the order, the uuid only breaks ties"
+        );
+        assert!(hits[0].similarity > hits[1].similarity);
+        assert!(hits[1].similarity > hits[2].similarity);
+    }
+
+    #[tokio::test]
+    async fn knn_similarities_stay_finite() {
+        let db = temp_db().await;
+        let mem = SqliteMemoryRepository::new();
+        let store = SqliteVectorStore::with_db(&db, 3);
+        const NS: i64 = crate::storage::namespace::DEFAULT_NAMESPACE_ID;
+
+        let mut uuids = Vec::new();
+        for content in ["usable", "zeroed"] {
+            let u = mem
+                .insert(
+                    &db,
+                    InsertMemoryInput {
+                        content,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+                .uuid();
+            uuids.push(u);
+        }
+        store.insert_vector(NS, uuids[0], "t", "m", &[1.0, 0.0, 0.0]).await.unwrap();
+        store.insert_vector(NS, uuids[1], "t", "m", &[0.0, 0.0, 0.0]).await.unwrap();
+
+        // a NaN vector cannot be stored, which is what keeps similarities
+        // finite and NaN out of the ordering below
+        let rejected = store
+            .insert_vector(NS, uuids[0], "t", "m", &[f32::NAN, 0.0, 0.0])
+            .await
+            .unwrap_err();
+        assert_eq!(rejected.code(), crate::error::ErrorCode::Validation);
+
+        let hits = store.knn_search(NS, &[1.0f32, 0.0, 0.0], 10, 0.0).await.unwrap();
+        assert!(hits.iter().all(|h| h.similarity.is_finite()));
+        // a zero vector divides by zero in a naive implementation; it must
+        // come back as a finite 0.0 similarity instead
+        let zeroed = hits.iter().find(|h| h.memory_uuid == uuids[1]).expect("zero vector listed");
+        assert_eq!(zeroed.similarity, 0.0);
+        assert_eq!(hits[0].memory_uuid, uuids[0]);
     }
 }
