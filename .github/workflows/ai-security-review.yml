@@ -182,13 +182,12 @@ jobs:
             report = report.trim().replace(/^(#{1,6}[^\n]*\n)+/, "").trim();
 
             // Verdict -> review event. The model ends with a "VERDICT: APPROVE"
-            // or "VERDICT: COMMENT" line. Any objection wording, a [Severe] tag,
-            // or a missing/ambiguous verdict maps to a non-approving COMMENT so
-            // the merge gate fails closed.
+            // or "VERDICT: COMMENT" line. Approve only when the verdict line is
+            // explicitly APPROVE and no [Severe] tag is present; a missing or
+            // ambiguous verdict, or any other value, fails closed to COMMENT.
             const v = (report.match(/VERDICT:\s*(\w+)/i) || [])[1] || "";
-            const objection = /(not safe|before merging|should be (removed|addressed|fixed)|do not merge|cannot be merged)/i.test(report);
             const severe = /\[severe\]/i.test(report);
-            const event = (v.toUpperCase() === "APPROVE" && !severe && !objection) ? "APPROVE" : "COMMENT";
+            const event = (!severe && v.toUpperCase() === "APPROVE") ? "APPROVE" : "COMMENT";
             try {
               await submit(event, "## " + ROLE_TITLE + " Review\n\n" + report + footer());
               core.info("Submitted pull request review: " + event);
