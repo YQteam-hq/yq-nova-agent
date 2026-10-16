@@ -64,10 +64,6 @@ impl NovaError {
         Self::new(ErrorCode::NotFound, msg.into(), None)
     }
 
-    pub fn validation_msg<M: Into<String>>(msg: M) -> Self {
-        Self::new(ErrorCode::Validation, msg.into(), None)
-    }
-
     pub fn conflict<M: Into<String>>(msg: M) -> Self {
         Self::new(ErrorCode::Conflict, msg.into(), None)
     }

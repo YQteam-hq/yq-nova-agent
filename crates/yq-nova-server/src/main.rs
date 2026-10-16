@@ -445,7 +445,7 @@ async fn run() -> NovaResult<()> {
 
             let target = if let Some(uuid_s) = args.uuid {
                 let u = uuid::Uuid::parse_str(&uuid_s).map_err(|e| {
-                    yq_nova_core::NovaError::validation_msg(format!("invalid --uuid {uuid_s}: {e}"))
+                    yq_nova_core::NovaError::validation(format!("invalid --uuid {uuid_s}: {e}"))
                 })?;
                 ForgetTarget::One(u)
             } else {
