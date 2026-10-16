@@ -125,43 +125,58 @@ jobs:
             }
 
             async function callModel() {
+              // Two-level retry ("circuit breaker"): a round is the fast backoff
+              // loop below. If a whole round keeps failing because the API returns
+              // error codes (429 / 5xx / network errors), cool down for 5 minutes
+              // and start a new round, so long rate-limit windows are survived
+              // instead of failing closed after the first round.
               const attempts = Number(process.env.ATTEMPTS) || 6;
+              const rounds = Number(process.env.ROUNDS) || 3;
+              const cooldownMs = 5 * 60 * 1000;
               let lastErr;
-              for (let i = 0; i < attempts; i++) {
-                try {
-                  const res = await fetch(process.env.GLM_ENDPOINT, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json", "Authorization": "Bearer " + key },
-                    body: JSON.stringify({
-                      model: process.env.GLM_MODEL || "glm-4.5-flash",
-                      messages: [
-                        { role: "system", content: system },
-                        { role: "user", content: user },
-                      ],
-                      temperature: 0.3,
-                      max_tokens: 3000,
-                    }),
-                  });
-                  if (!res.ok) {
-                    const detail = await res.text();
-                    const err = new Error("API " + res.status + ": " + detail.slice(0, 300));
-                    err.rateLimited = res.status === 429 || /(1302|rate limit|too many requests|\u901f\u7387)/i.test(detail);
-                    throw err;
+              for (let round = 1; round <= rounds; round++) {
+                for (let i = 0; i < attempts; i++) {
+                  try {
+                    const res = await fetch(process.env.GLM_ENDPOINT, {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json", "Authorization": "Bearer " + key },
+                      body: JSON.stringify({
+                        model: process.env.GLM_MODEL || "glm-4.5-flash",
+                        messages: [
+                          { role: "system", content: system },
+                          { role: "user", content: user },
+                        ],
+                        temperature: 0.3,
+                        max_tokens: 3000,
+                      }),
+                      signal: AbortSignal.timeout(60000),
+                    });
+                    if (!res.ok) {
+                      const detail = await res.text();
+                      const err = new Error("API " + res.status + ": " + detail.slice(0, 300));
+                      err.rateLimited = res.status === 429 || /(1302|rate limit|too many requests|\u901f\u7387)/i.test(detail);
+                      err.apiError = true;
+                      throw err;
+                    }
+                    const data = await res.json();
+                    const txt = (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || "";
+                    if (!txt.trim()) throw new Error("empty response");
+                    return txt;
+                  } catch (e) {
+                    lastErr = e;
+                    core.warning("AI review attempt " + (i + 1) + "/" + attempts + " (round " + round + "/" + rounds + ") failed: " + e.message);
+                    if (i < attempts - 1) {
+                      const wait = e.rateLimited
+                        ? Math.min(120000, 30000 * Math.pow(2, i))
+                        : 2000 * Math.pow(2, i);
+                      core.warning("Waiting " + Math.round(wait / 1000) + "s before retry");
+                      await sleep(wait);
+                    }
                   }
-                  const data = await res.json();
-                  const txt = (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || "";
-                  if (!txt.trim()) throw new Error("empty response");
-                  return txt;
-                } catch (e) {
-                  lastErr = e;
-                  core.warning("AI review attempt " + (i + 1) + "/" + attempts + " failed: " + e.message);
-                  if (i < attempts - 1) {
-                    const wait = e.rateLimited
-                      ? Math.min(120000, 30000 * Math.pow(2, i))
-                      : 2000 * Math.pow(2, i);
-                    core.warning("Waiting " + Math.round(wait / 1000) + "s before retry");
-                    await sleep(wait);
-                  }
+                }
+                if (round < rounds && lastErr && (lastErr.apiError || lastErr.rateLimited)) {
+                  core.warning("Round " + round + " failed with API error codes; cooling down 5 minutes before the next round.");
+                  await sleep(cooldownMs);
                 }
               }
               throw lastErr;
