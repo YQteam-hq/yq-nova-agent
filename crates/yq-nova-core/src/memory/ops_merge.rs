@@ -4,7 +4,10 @@ use uuid::Uuid;
 use super::MemoryService;
 use crate::{
     error::{NovaError, NovaResult},
-    storage::{MemoryStatus, memory::MemoryRepository},
+    storage::{
+        MemoryStatus,
+        memory::{MemoryRecord, MemoryRepository},
+    },
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,34 +58,41 @@ pub async fn merge_memories(svc: &MemoryService, input: MergeInput) -> NovaResul
         }
     }
 
-    for u in &uuids {
-        svc.memory_repo
-            .get_by_uuid(&svc.database, ns, *u)
-            .await
-            .map_err(|_| NovaError::validation(format!("merge: uuid {u} does not exist")))?;
+    // One batch lookup replaces the old per-uuid existence probe followed by
+    // a second per-uuid fetch of the very same rows.
+    let records = svc.memory_repo.get_many_by_uuid(&svc.database, ns, &uuids).await?;
+    if records.len() != uuids.len() {
+        let found: std::collections::HashSet<Uuid> = records.iter().map(|r| r.uuid).collect();
+        let missing: Vec<String> =
+            uuids.iter().filter(|u| !found.contains(u)).map(|u| u.to_string()).collect();
+        return Err(NovaError::validation(format!(
+            "merge: uuid {} does not exist",
+            missing.join(", ")
+        )));
     }
-
-    let records = {
-        let mut records = Vec::with_capacity(uuids.len());
-        for u in &uuids {
-            let rec = svc.memory_repo.get_by_uuid(&svc.database, ns, *u).await?;
-            records.push(rec);
-        }
-        records
-    };
+    let mut by_uuid: std::collections::HashMap<Uuid, MemoryRecord> =
+        records.into_iter().map(|r| (r.uuid, r)).collect();
 
     let kept_uuid = match keep_uuid {
         Some(u) => u,
         None => {
-            let mut best = &records[0];
-            for rec in &records[1..] {
-                let older = rec.created_at < best.created_at;
-                let same_age = rec.created_at == best.created_at;
-                if older || (same_age && rec.importance > best.importance) {
-                    best = rec;
-                }
+            let mut best: Option<&MemoryRecord> = None;
+            for u in &uuids {
+                let rec = &by_uuid[u];
+                best = match best {
+                    None => Some(rec),
+                    Some(b) => {
+                        let older = rec.created_at < b.created_at;
+                        let same_age = rec.created_at == b.created_at;
+                        if older || (same_age && rec.importance > b.importance) {
+                            Some(rec)
+                        } else {
+                            Some(b)
+                        }
+                    },
+                };
             }
-            best.uuid
+            best.expect("uuids contains at least 2 entries").uuid
         },
     };
 
@@ -93,7 +103,10 @@ pub async fn merge_memories(svc: &MemoryService, input: MergeInput) -> NovaResul
         merged_strs.iter().map(|s| serde_json::Value::String(s.clone())).collect(),
     );
 
-    let keep_meta = svc.memory_repo.get_by_uuid(&svc.database, ns, kept_uuid).await?.metadata;
+    // The kept record was already fetched by the batch lookup above; nothing
+    // has touched it since, so re-reading it from the database is redundant.
+    let keep_meta =
+        by_uuid.remove(&kept_uuid).expect("kept_uuid is one of the validated uuids").metadata;
     let mut keep_meta_obj = match keep_meta {
         serde_json::Value::Object(m) => m,
         _ => serde_json::Map::new(),
@@ -104,6 +117,10 @@ pub async fn merge_memories(svc: &MemoryService, input: MergeInput) -> NovaResul
         .await?;
 
     for u in &merged {
+        // Deliberately re-read instead of reusing the batch snapshot: the
+        // metadata written below replaces the whole document, so a concurrent
+        // writer that touched this record during the merge would otherwise be
+        // silently reverted.
         let rec = svc.memory_repo.get_by_uuid(&svc.database, ns, *u).await?;
         svc.memory_repo.update_status(&svc.database, ns, *u, MemoryStatus::Archived).await?;
 
