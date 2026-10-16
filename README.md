@@ -249,7 +249,31 @@ curl -X POST http://127.0.0.1:7999/v1/namespaces \
 
 # List namespaces with pagination (admin only)
 curl 'http://127.0.0.1:7999/v1/namespaces?limit=100&offset=0'
+
+# Read one namespace (admin only)
+curl http://127.0.0.1:7999/v1/namespaces/team-a
+
+# Rename / re-describe a namespace (admin only)
+curl -X PATCH http://127.0.0.1:7999/v1/namespaces/team-a \
+  -H 'Content-Type: application/json' \
+  -d '{"description": "Customer A (renamed)"}'
+
+# Delete a namespace and every memory, tag, entity and relation in it (admin only)
+curl -X DELETE http://127.0.0.1:7999/v1/namespaces/team-a
 ```
+
+The `default` namespace cannot be deleted, and all four endpoints require the
+admin token: a namespace-scoped API key is rejected.
+
+### Schema
+
+Namespacing is part of the shipped schema, so enabling it needs no manual
+migration: `migrations/005_namespaces.sql` adds `namespace_id` to `memory_items`,
+`entities`, `relations`, `tags` and `memory_tags`, and creates namespace-leading
+indexes for the queries that filter on it (`idx_memory_items_namespace`,
+`idx_entities_namespace_name_type`, `idx_relations_namespace_src`,
+`idx_relations_namespace_tgt`, `idx_memory_tags_namespace_uuid`, ...). Upgrading
+an existing database therefore only attaches the pre-existing rows to `default`.
 
 ### Scoping requests
 

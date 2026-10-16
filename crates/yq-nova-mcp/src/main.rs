@@ -679,4 +679,125 @@ mod tests {
             resolve_namespace_id(&db, "   ").await.expect_err("empty namespace must be rejected");
         assert!(err.to_string().contains("must not be empty"), "{err}");
     }
+    async fn temp_services(db: &Database) -> (MemoryService, GraphService) {
+        let provider: std::sync::Arc<dyn yq_nova_core::embedding::EmbeddingProvider> =
+            std::sync::Arc::new(MockEmbeddingProvider::new(8));
+        let memory = MemoryService::new(db.clone(), provider);
+        let graph = GraphService::with_parts(
+            db.clone(),
+            std::sync::Arc::new(yq_nova_core::graph::extractor::RegexWikiExtractor::new()),
+        );
+        (memory, graph)
+    }
+
+    fn payload(res: &HandlerResult) -> serde_json::Value {
+        if let Some(err) = &res.error {
+            panic!("tool call returned a protocol error: code {} {}", err.code, err.message);
+        }
+        let result = res.result.as_ref().expect("tool call has a result payload");
+        assert!(result.get("isError").is_none(), "tool reported an error: {result}");
+        let text = result["content"][0]["text"].as_str().expect("text content");
+        serde_json::from_str(text).expect("tool payload is JSON")
+    }
+
+    async fn create_namespace(db: &Database, name: &str) -> i64 {
+        SqliteNamespaceRepository::new()
+            .create(
+                db,
+                CreateNamespaceInput {
+                    name,
+                    description: None,
+                    config: None,
+                },
+            )
+            .await
+            .expect("create namespace")
+            .id
+    }
+
+    #[tokio::test]
+    async fn tool_calls_cannot_reach_another_namespace() {
+        let db = temp_db("isolation").await;
+        let (memory, graph) = temp_services(&db).await;
+        let team_a = create_namespace(&db, "team-a").await;
+        let team_b = create_namespace(&db, "team-b").await;
+
+        // write through the same path a client uses: the tool dispatcher
+        let written = payload(
+            &handle_tool_call(
+                "nova_remember",
+                &serde_json::json!({"content": "alpha team only secret", "importance": 0.9}),
+                &memory,
+                &graph,
+                team_a,
+            )
+            .await,
+        );
+        let uuid = written["uuid"].as_str().expect("uuid").to_string();
+
+        let in_a = payload(
+            &handle_tool_call(
+                "nova_recall",
+                &serde_json::json!({"query": "alpha team only secret"}),
+                &memory,
+                &graph,
+                team_a,
+            )
+            .await,
+        );
+        assert!(
+            in_a["hits"].as_array().expect("hits").iter().any(|h| h["memory"]["uuid"] == uuid),
+            "the owning namespace must recall its own memory"
+        );
+
+        // the very same query in the other namespace sees nothing
+        let in_b = payload(
+            &handle_tool_call(
+                "nova_recall",
+                &serde_json::json!({"query": "alpha team only secret"}),
+                &memory,
+                &graph,
+                team_b,
+            )
+            .await,
+        );
+        assert!(
+            in_b["hits"].as_array().expect("hits").is_empty(),
+            "another namespace must not recall the memory"
+        );
+
+        let list_b = payload(
+            &handle_tool_call("nova_list", &serde_json::json!({}), &memory, &graph, team_b).await,
+        );
+        assert_eq!(list_b["total"], 0, "the other namespace lists nothing");
+
+        // forgetting through the other namespace cannot reach the row either
+        handle_tool_call(
+            "nova_forget",
+            &serde_json::json!({"uuid": uuid, "mode": "hard"}),
+            &memory,
+            &graph,
+            team_b,
+        )
+        .await;
+
+        let still_there = payload(
+            &handle_tool_call(
+                "nova_recall",
+                &serde_json::json!({"query": "alpha team only secret"}),
+                &memory,
+                &graph,
+                team_a,
+            )
+            .await,
+        );
+        assert!(
+            still_there["hits"]
+                .as_array()
+                .expect("hits")
+                .iter()
+                .any(|h| h["memory"]["uuid"] == uuid),
+            "a foreign namespace must not be able to forget the memory"
+        );
+    }
 }
