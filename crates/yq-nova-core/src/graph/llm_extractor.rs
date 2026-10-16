@@ -212,7 +212,7 @@ impl LLMEntityExtractor {
             let status = response.status();
             if !status.is_success() {
                 let raw = response.text().await.unwrap_or_default();
-                let snippet = if raw.len() > 400 { &raw[..400] } else { raw.as_str() };
+                let snippet = crate::embedding::truncate_utf8(&raw, 400);
                 return Err((
                     classify_http_status(status),
                     anyhow::anyhow!("HTTP {}: {}", status.as_u16(), snippet),
@@ -466,6 +466,27 @@ mod tests {
         };
         let extractor = LLMEntityExtractor::new(config).unwrap();
         assert!(extractor.extract("x").await.is_err());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn multibyte_error_body_does_not_panic() {
+        // 200 three-byte characters = 600 bytes; byte 400 lands inside a
+        // character, so a naive `&body[..400]` would panic while an error
+        // message is being built.
+        let body = "中".repeat(200);
+        assert!(body.len() > 400);
+        assert!(!body.is_char_boundary(400));
+
+        let (base, server) = spawn_mock_server(body, 400).await;
+        let config = LlmExtractorConfig {
+            base_url: base,
+            ..base_config()
+        };
+        let extractor = LLMEntityExtractor::new(config).unwrap();
+        let err = extractor.extract("x").await.unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("HTTP 400"), "unexpected error message: {message}");
         server.abort();
     }
 
