@@ -2,6 +2,11 @@
 
 All notable changes to **yq-nova-agent** are documented in this file. The project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Documentation
+- Add an Unreleased section to keep upcoming changes organized.
+
 ## [0.4.0] - 2026-09-14
 
 ### Added
