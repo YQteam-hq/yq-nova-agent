@@ -500,6 +500,63 @@ struct BuiltQuery {
     binds: Vec<BindValue>,
 }
 
+/// Append the SQL predicate for one `metadata_match` pair.
+///
+/// `metadata_match` used to be applied only by the in-memory `passes_filter`
+/// post-filter, so the SQL layer silently ignored it: `count` over-reported,
+/// `list`/`list_ordered` returned rows that were later dropped (breaking
+/// LIMIT/OFFSET pagination), and `forget` with a `ForgetTarget::Filter`
+/// archived or deleted memories that did not match at all. Pushing the
+/// predicate down to SQLite keeps every consumer of `MemoryFilter` in
+/// agreement with the in-memory check.
+///
+/// `json_each` is used instead of a JSON path because paths cannot address
+/// object labels containing double quotes (`$."say""hi"""` evaluates to NULL
+/// on SQLite), while `json_each` exposes labels as plain TEXT. Its `value`
+/// column already holds the member as a SQL value - TEXT for strings,
+/// INTEGER/REAL for numbers, 0/1 for booleans, SQL NULL for JSON null and the
+/// member's JSON text for arrays/objects - so each expected value binds with
+/// the matching storage class.
+fn push_metadata_match(
+    key: &str,
+    val: &serde_json::Value,
+    where_binds: &mut Vec<BindValue>,
+    where_clauses: &mut Vec<String>,
+) {
+    where_binds.push(BindValue::Text(key.to_string()));
+    let value_sql: &str = match val {
+        serde_json::Value::Null => "je.value IS NULL",
+        serde_json::Value::Bool(b) => {
+            where_binds.push(BindValue::Int(i64::from(*b)));
+            "je.value = ?"
+        },
+        serde_json::Value::Number(n) => {
+            let bound = if let Some(i) = n.as_i64() {
+                BindValue::Int(i)
+            } else if let Some(u) = n.as_u64() {
+                BindValue::Int(u as i64)
+            } else {
+                BindValue::Real(n.as_f64().unwrap_or(0.0))
+            };
+            where_binds.push(bound);
+            "je.value = ?"
+        },
+        serde_json::Value::String(s) => {
+            where_binds.push(BindValue::Text(s.clone()));
+            "je.value = ?"
+        },
+        composite => {
+            // Arrays/objects: compare the member's JSON text with the compact
+            // serialization of the expected value.
+            where_binds.push(BindValue::Text(composite.to_string()));
+            "je.value = ?"
+        },
+    };
+    where_clauses.push(format!(
+        "EXISTS (SELECT 1 FROM json_each(m.metadata_json) je WHERE je.key = ? AND {value_sql})"
+    ));
+}
+
 fn build_filter(filter: &MemoryFilter, count_only: bool) -> BuiltQuery {
     let cols_list: &str = "m.id, m.uuid, m.namespace_id, m.content, m.content_hash, \
                            m.metadata_json, m.source, m.importance, m.access_count, \
@@ -604,54 +661,9 @@ fn build_filter(filter: &MemoryFilter, count_only: bool) -> BuiltQuery {
         }
     }
 
-    // `metadata_match` used to be applied only by the in-memory
-    // `passes_filter` post-filter, so the SQL layer silently ignored it:
-    // `count` over-reported, `list`/`list_ordered` returned rows that were
-    // later dropped (breaking LIMIT/OFFSET pagination), and `forget` with a
-    // `ForgetTarget::Filter` archived or deleted memories that did not match
-    // at all. Push the predicate down to SQLite so every consumer of
-    // `MemoryFilter` sees the same rows.
-    //
-    // `json_each` exposes object labels as plain TEXT (no JSON-path quoting
-    // problems for keys containing quotes or dots) and its `value` column
-    // holds the SQL value of the member: TEXT for strings, INTEGER/REAL for
-    // numbers, 0/1 for booleans, SQL NULL for JSON null, and the member's
-    // JSON text for arrays/objects.
     if let Some(pairs) = &filter.metadata_match {
         for (key, val) in pairs {
-            where_binds.push(BindValue::Text(key.clone()));
-            let value_sql: &str = match val {
-                serde_json::Value::Null => "je.value IS NULL",
-                serde_json::Value::Bool(b) => {
-                    where_binds.push(BindValue::Int(i64::from(*b)));
-                    "je.value = ?"
-                },
-                serde_json::Value::Number(n) => {
-                    let bound = if let Some(i) = n.as_i64() {
-                        BindValue::Int(i)
-                    } else if let Some(u) = n.as_u64() {
-                        BindValue::Int(u as i64)
-                    } else {
-                        BindValue::Real(n.as_f64().unwrap_or(0.0))
-                    };
-                    where_binds.push(bound);
-                    "je.value = ?"
-                },
-                serde_json::Value::String(s) => {
-                    where_binds.push(BindValue::Text(s.clone()));
-                    "je.value = ?"
-                },
-                composite => {
-                    // Arrays/objects: compare the member's JSON text with
-                    // the compact serialization of the expected value.
-                    where_binds.push(BindValue::Text(composite.to_string()));
-                    "je.value = ?"
-                },
-            };
-            where_clauses.push(format!(
-                "EXISTS (SELECT 1 FROM json_each(m.metadata_json) je WHERE je.key = ? AND \
-                 {value_sql})"
-            ));
+            push_metadata_match(key, val, &mut where_binds, &mut where_clauses);
         }
     }
 
