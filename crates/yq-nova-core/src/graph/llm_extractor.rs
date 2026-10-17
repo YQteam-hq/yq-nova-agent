@@ -5,7 +5,10 @@ use serde::{Deserialize, Serialize};
 
 use super::extractor::{EntityCandidate, EntityExtractor, Extraction, RelationCandidate};
 use crate::{
-    embedding::retry::{RetryAction, RetryConfig, classify_http_status, with_retry},
+    embedding::{
+        retry::{RetryAction, RetryConfig, classify_http_status, with_retry},
+        truncate_utf8,
+    },
     error::{NovaError, NovaResult},
 };
 
@@ -212,7 +215,10 @@ impl LLMEntityExtractor {
             let status = response.status();
             if !status.is_success() {
                 let raw = response.text().await.unwrap_or_default();
-                let snippet = if raw.len() > 400 { &raw[..400] } else { raw.as_str() };
+                // 400 is the shared snippet budget across every provider: long
+                // enough to identify the upstream problem, short enough to keep
+                // logs readable. It only shapes diagnostics, never behavior.
+                let snippet = truncate_utf8(&raw, 400);
                 return Err((
                     classify_http_status(status),
                     anyhow::anyhow!("HTTP {}: {}", status.as_u16(), snippet),
