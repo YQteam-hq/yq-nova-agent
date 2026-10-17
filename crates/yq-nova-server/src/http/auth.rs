@@ -192,6 +192,15 @@ mod tests {
         namespace_keys: std::collections::BTreeMap<String, String>,
         seed_namespaces: &[&str],
     ) -> axum::Router {
+        let (router, _db) = make_router_full_with_db(auth_token, namespace_keys, seed_namespaces).await;
+        router
+    }
+
+    async fn make_router_full_with_db(
+        auth_token: &str,
+        namespace_keys: std::collections::BTreeMap<String, String>,
+        seed_namespaces: &[&str],
+    ) -> (axum::Router, yq_nova_core::storage::Database) {
         let dir = std::env::temp_dir().join(format!(
             "yq-nova-test-auth-{}-{}",
             std::process::id(),
@@ -232,8 +241,37 @@ mod tests {
             namespace_keys,
             ..Default::default()
         };
-        let state = AppState::new(srv_cfg, db, memory, graph);
-        crate::http::build_router(state)
+        let state = AppState::new(srv_cfg, db.clone(), memory, graph);
+        (crate::http::build_router(state), db)
+    }
+
+    async fn post_json(
+        router: axum::Router,
+        uri: &str,
+        token: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let req = Request::builder()
+            .uri(uri)
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    async fn ns_id(db: &yq_nova_core::storage::Database, name: &str) -> i64 {
+        yq_nova_core::storage::SqliteNamespaceRepository::new()
+            .get_by_name(db, name)
+            .await
+            .expect("query namespace")
+            .expect("namespace exists")
+            .id
     }
 
     const HEALTH: &str = "/v1/health";
@@ -371,5 +409,117 @@ mod tests {
             .unwrap();
         let resp = router.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    async fn two_tenant_router() -> (axum::Router, yq_nova_core::storage::Database) {
+        let mut keys = std::collections::BTreeMap::new();
+        keys.insert("tenant-a".to_string(), "key-a".to_string());
+        keys.insert("tenant-b".to_string(), "key-b".to_string());
+        make_router_full_with_db("", keys, &["tenant-a", "tenant-b"]).await
+    }
+
+    #[tokio::test]
+    async fn recall_filter_cannot_escape_authenticated_namespace() {
+        let (router, db) = two_tenant_router().await;
+        let tenant_a_id = ns_id(&db, "tenant-a").await;
+
+        // tenant-a stores a memory only it should ever see.
+        let (status, out) = post_json(
+            router.clone(),
+            "/v1/memory/remember",
+            "key-a",
+            serde_json::json!({"content": "tenant-a confidential quarterly plan"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let secret = out["uuid"].as_str().expect("uuid in response").to_string();
+
+        // tenant-a can recall its own memory normally.
+        let (status, out) = post_json(
+            router.clone(),
+            "/v1/memory/recall",
+            "key-a",
+            serde_json::json!({
+                "query": "quarterly plan",
+                "top_k": 10,
+                "score_threshold": 0.0,
+                "similarity_threshold": -1.0,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            out["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|h| h["memory"]["uuid"] == secret),
+            "tenant-a should recall its own memory"
+        );
+
+        // tenant-b forges filter.namespace_id to point at tenant-a: the
+        // authenticated namespace must still win, so nothing leaks.
+        let (status, out) = post_json(
+            router.clone(),
+            "/v1/memory/recall",
+            "key-b",
+            serde_json::json!({
+                "query": "quarterly plan",
+                "top_k": 10,
+                "score_threshold": 0.0,
+                "similarity_threshold": -1.0,
+                "filter": {"namespace_id": tenant_a_id},
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let hits_empty = out["hits"].as_array().map(|h| h.is_empty()).unwrap_or(true);
+        assert!(
+            hits_empty,
+            "forged filter.namespace_id must not return tenant-a memories, got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_filter_cannot_escape_authenticated_namespace() {
+        let (router, db) = two_tenant_router().await;
+        let tenant_a_id = ns_id(&db, "tenant-a").await;
+
+        let (status, _) = post_json(
+            router.clone(),
+            "/v1/memory/remember",
+            "key-a",
+            serde_json::json!({"content": "tenant-a confidential quarterly plan"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // tenant-b forges filter.namespace_id to list tenant-a's memories.
+        let (status, out) = post_json(
+            router.clone(),
+            "/v1/memory/list",
+            "key-b",
+            serde_json::json!({
+                "limit": 50,
+                "filter": {"namespace_id": tenant_a_id},
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            out["total"], 0,
+            "forged filter.namespace_id must not list tenant-a memories, got: {out}"
+        );
+
+        // tenant-a still sees its own memory.
+        let (status, out) = post_json(
+            router.clone(),
+            "/v1/memory/list",
+            "key-a",
+            serde_json::json!({"limit": 50}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(out["total"], 1, "tenant-a should list its own memory, got: {out}");
     }
 }
