@@ -18,6 +18,7 @@ function recordClient(opts = {}) {
   };
   const client = new NovaClient("http://127.0.0.1:7999", {
     apiKey: "k",
+    namespace: opts.namespace,
     fetch: stubFetch,
   });
   return { client, calls };
@@ -97,4 +98,62 @@ test("non-2xx responses throw NovaApiError", async () => {
 
 test("empty base url is rejected", () => {
   assert.throws(() => new NovaClient(""), /must not be empty/);
+});
+
+test("x-namespace header defaults to \"default\" and can be configured", async () => {
+  const def = recordClient();
+  await def.client.health();
+  assert.equal(def.calls[0].init.headers["x-namespace"], "default");
+
+  const scoped = recordClient({ namespace: "team-a" });
+  await scoped.client.health();
+  assert.equal(scoped.calls[0].init.headers["x-namespace"], "team-a");
+
+  // Namespaces are stripped of surrounding whitespace.
+  const padded = recordClient({ namespace: "  team-a  " });
+  await padded.client.health();
+  assert.equal(padded.calls[0].init.headers["x-namespace"], "team-a");
+});
+
+test("unsafe namespace names are rejected", () => {
+  // The namespace is sent in the x-namespace header, so characters that could
+  // split or forge a header must be rejected.
+  for (const name of [
+    "team\na", // newline injection
+    "team\r\nX-Evil: 1", // CRLF header splitting
+    "team a", // space inside the name
+    "team:a", // colon
+    "-team", // must start alphanumeric
+    "team/../etc", // path characters
+    "team\u00e9", // non-ASCII letter
+    "team\x00", // NUL byte
+  ]) {
+    assert.throws(
+      () => new NovaClient("http://127.0.0.1:7999", { namespace: name, fetch: async () => {} }),
+      /invalid characters/,
+      `expected rejection for ${JSON.stringify(name)}`,
+    );
+  }
+  assert.throws(
+    () => new NovaClient("http://127.0.0.1:7999", { namespace: "   ", fetch: async () => {} }),
+    /must not be empty/,
+  );
+});
+
+test("withNamespace returns a scoped copy carrying all options", async () => {
+  const { client, calls } = recordClient({ namespace: "team-a" });
+  const scoped = client.withNamespace("team-b");
+  assert.notEqual(scoped, client);
+
+  await scoped.remember({ content: "hello" });
+  assert.equal(calls[0].init.headers["x-namespace"], "team-b");
+  assert.equal(calls[0].init.headers["Authorization"], "Bearer k");
+  assert.equal(calls[0].init.headers["Content-Type"], "application/json");
+
+  // The original client is untouched and still sends its own namespace.
+  await client.remember({ content: "hello" });
+  assert.equal(calls[1].init.headers["x-namespace"], "team-a");
+
+  // The scoped client validates its input too.
+  assert.throws(() => client.withNamespace("bad name"), /invalid characters/);
 });

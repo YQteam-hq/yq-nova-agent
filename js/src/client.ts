@@ -37,7 +37,29 @@ import type {
 export interface NovaClientOptions {
   apiKey?: string;
   timeoutMs?: number;
+  namespace?: string;
   fetch?: typeof fetch;
+}
+
+// A namespace travels in the `x-namespace` HTTP header, so only characters
+// that are safe inside a header value are accepted: the name must start with
+// an alphanumeric character and may then contain alphanumerics, hyphens and
+// underscores. This structurally rules out header injection (CR/LF/colon).
+const NAMESPACE_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
+
+function validateNamespace(name: string, where: string): string {
+  const cleaned = name.trim();
+  if (!cleaned) {
+    throw new Error(`${where}: name must not be empty`);
+  }
+  if (!NAMESPACE_RE.test(cleaned)) {
+    throw new Error(
+      `${where}: '${cleaned}' contains invalid characters; a namespace must start ` +
+        "with a letter or digit and may then contain only letters, digits, " +
+        "hyphens and underscores",
+    );
+  }
+  return cleaned;
 }
 
 export class NovaApiError extends Error {
@@ -65,6 +87,7 @@ export class NovaClient {
   private readonly baseUrl: string;
   private readonly apiKey?: string;
   private readonly timeoutMs: number;
+  private readonly namespace: string;
   private readonly fetchImpl: typeof fetch;
 
   constructor(baseUrl: string, options: NovaClientOptions = {}) {
@@ -74,10 +97,27 @@ export class NovaClient {
     this.baseUrl = baseUrl.replace(/\/+$/, "");
     this.apiKey = options.apiKey;
     this.timeoutMs = options.timeoutMs ?? 30000;
+    this.namespace = validateNamespace(options.namespace ?? "default", "namespace");
     this.fetchImpl = options.fetch ?? ((typeof globalThis !== "undefined" && globalThis.fetch) as typeof fetch);
     if (!this.fetchImpl) {
       throw new Error("A fetch implementation is required; Node 18+ and browsers provide one globally");
     }
+  }
+
+  /** Return a copy of this client scoped to another namespace. */
+  withNamespace(name: string): NovaClient {
+    // Copying the instance keeps every configuration attribute (including any
+    // added in the future) instead of re-listing them here.
+    const clone: NovaClient = Object.assign(Object.create(Object.getPrototypeOf(this)), this);
+    // `namespace` is readonly for callers; this is the one intentional
+    // mutation of the fresh copy.
+    Object.defineProperty(clone, "namespace", {
+      value: validateNamespace(name, "withNamespace"),
+      writable: true,
+      enumerable: true,
+      configurable: true,
+    });
+    return clone;
   }
 
   health() {
@@ -181,7 +221,10 @@ export class NovaClient {
     const query = params ? this.encodeParams(params) : "";
     const url = this.baseUrl + path + (query ? `?${query}` : "");
 
-    const headers: Record<string, string> = { Accept: "application/json" };
+    const headers: Record<string, string> = {
+      Accept: "application/json",
+      "x-namespace": this.namespace,
+    };
     let payload: BodyInit | undefined;
     if (body !== undefined) {
       headers["Content-Type"] = "application/json";
