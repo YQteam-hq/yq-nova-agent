@@ -288,7 +288,7 @@ impl EntityRepository for SqliteEntityRepository {
         let mut where_clauses: Vec<&str> = Vec::new();
         where_clauses.push("namespace_id = ?");
         if name_prefix.is_some() {
-            where_clauses.push("name LIKE ?");
+            where_clauses.push("name LIKE ? ESCAPE '\\'");
         }
         if type_filter.is_some() {
             where_clauses.push("type = ?");
@@ -306,7 +306,7 @@ impl EntityRepository for SqliteEntityRepository {
         );
         let mut q = sqlx::query(&sql).bind(namespace_id);
         if let Some(np) = name_prefix {
-            q = q.bind(format!("{}%", np.replace('%', "\\%")));
+            q = q.bind(format!("{}%", escape_like_prefix(np)));
         }
         if let Some(t) = type_filter {
             q = q.bind(t);
@@ -319,6 +319,26 @@ impl EntityRepository for SqliteEntityRepository {
         }
         Ok(out)
     }
+}
+
+/// Escape `input` so it can be used as a literal prefix inside a SQLite
+/// `LIKE` pattern.
+///
+/// SQLite only treats backslash as an escape character when the query
+/// declares `ESCAPE '\'`; without it `\%` is a literal backslash followed by
+/// "match anything", and `_` silently keeps acting as a single-character
+/// wildcard. Both the escape character itself and the two wildcards are
+/// therefore escaped here, and the query above declares the matching ESCAPE
+/// clause.
+fn escape_like_prefix(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 fn row_to_entity(row: &sqlx::sqlite::SqliteRow) -> NovaResult<EntityRecord> {
@@ -541,5 +561,46 @@ mod tests {
         assert_ne!(a.uuid, b.uuid);
         assert_eq!(a.description.as_deref(), None);
         assert_eq!(b.description.as_deref(), Some("other"));
+    }
+
+    #[test]
+    fn escape_like_prefix_escapes_wildcards_and_backslash() {
+        assert_eq!(escape_like_prefix("plain"), "plain");
+        assert_eq!(escape_like_prefix("100%"), "100\\%");
+        assert_eq!(escape_like_prefix("a_c"), "a\\_c");
+        assert_eq!(escape_like_prefix("a\\b"), "a\\\\b");
+        assert_eq!(escape_like_prefix("%_\\"), "\\%\\_\\\\");
+    }
+
+    #[tokio::test]
+    async fn name_prefix_treats_wildcards_literally() {
+        let db = temp_db().await;
+        let repo = SqliteEntityRepository::new();
+        for name in ["100% done", "1000 items", "a_c", "abc", "plain"] {
+            repo.upsert(
+                &db,
+                UpsertEntityInput {
+                    namespace_id: NS,
+                    name,
+                    r#type: "concept",
+                    description: None,
+                    metadata: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let pct = repo.list(&db, NS, Some("100%"), None, 100, 0).await.unwrap();
+        let names: Vec<&str> = pct.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["100% done"], "'%' must match literally, not as a wildcard");
+
+        let underscore = repo.list(&db, NS, Some("a_c"), None, 100, 0).await.unwrap();
+        let names: Vec<&str> = underscore.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["a_c"], "'_' must match literally, not any single char");
+
+        let plain = repo.list(&db, NS, Some("pla"), None, 100, 0).await.unwrap();
+        assert_eq!(plain.len(), 1, "ordinary prefixes still match");
+        assert_eq!(plain[0].name, "plain");
     }
 }
