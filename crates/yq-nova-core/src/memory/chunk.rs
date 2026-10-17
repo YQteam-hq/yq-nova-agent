@@ -88,8 +88,15 @@ fn chunk_by_paragraph(text: &str, max_chars: usize, overlap_chars: usize) -> Vec
             chunks.push(current.clone());
 
             if overlap_chars > 0 {
+                // Cut the overlap out of the previous chunk on a char
+                // boundary, otherwise a multi-byte character can be split
+                // and the slice panics.
                 let take = overlap_chars.min(current.len());
-                current = current[current.len() - take..].to_string();
+                let mut cut = current.len() - take;
+                while !current.is_char_boundary(cut) {
+                    cut += 1;
+                }
+                current = current[cut..].to_string();
                 current.push_str("\n\n");
                 current.push_str(trimmed);
             } else {
@@ -108,22 +115,29 @@ fn chunk_by_paragraph(text: &str, max_chars: usize, overlap_chars: usize) -> Vec
 }
 
 fn chunk_by_char(text: &str, max_chars: usize, overlap_chars: usize) -> Vec<String> {
-    let len = text.len();
-    if len == 0 {
+    let total_chars = text.chars().count();
+    if total_chars == 0 {
         return Vec::new();
     }
-    if len <= max_chars {
+    if total_chars <= max_chars {
         return vec![text.to_string()];
     }
 
     let step = max_chars.saturating_sub(overlap_chars);
     let step = if step == 0 { 1 } else { step };
 
+    // Byte offset of every char boundary, computed once so that each chunk
+    // slice starts and ends on a boundary and never splits a multi-byte
+    // UTF-8 character.
+    let mut char_bounds: Vec<usize> = Vec::with_capacity(total_chars + 1);
+    char_bounds.extend(text.char_indices().map(|(byte_idx, _)| byte_idx));
+    char_bounds.push(text.len());
+
     let mut chunks: Vec<String> = Vec::new();
     let mut start = 0;
-    while start < len {
-        let end = (start + max_chars).min(len);
-        chunks.push(text[start..end].to_string());
+    while start < total_chars {
+        let end = (start + max_chars).min(total_chars);
+        chunks.push(text[char_bounds[start]..char_bounds[end]].to_string());
         start += step;
     }
 
@@ -262,6 +276,71 @@ mod tests {
                 &chunks[1][..3.min(chunks[1].len())],
                 &chunks[0][chunks[0].len() - 3..]
             );
+        }
+    }
+
+    #[test]
+    fn chunk_by_char_handles_multibyte_characters() {
+        // Every CJK character is 3 bytes, so a byte-based window would land
+        // inside a character and panic.
+        let text = "\u{6f22}".repeat(300);
+        let opts = ChunkOptions {
+            enabled: true,
+            split_by: SplitBy::Char,
+            max_chars: 200,
+            overlap_chars: 50,
+        };
+        let chunks = chunk_text(&text, &opts);
+        assert!(chunks.len() >= 2, "should produce multiple chunks, got {}", chunks.len());
+        for c in &chunks {
+            assert!(!c.is_empty(), "chunk should not be empty");
+            assert!(
+                c.chars().count() <= 200,
+                "chunk exceeded max_chars: {} chars",
+                c.chars().count()
+            );
+        }
+        assert_eq!(chunks[0].chars().count(), 200);
+    }
+
+    #[test]
+    fn chunk_by_char_handles_4byte_characters() {
+        // Emoji are 4 bytes each and byte offsets land inside them.
+        let text = "\u{1f389}".repeat(250);
+        let opts = ChunkOptions {
+            enabled: true,
+            split_by: SplitBy::Char,
+            max_chars: 200,
+            overlap_chars: 0,
+        };
+        let chunks = chunk_text(&text, &opts);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].chars().count(), 200);
+        assert_eq!(chunks[1].chars().count(), 50);
+    }
+
+    #[test]
+    fn chunk_by_paragraph_overlap_respects_char_boundaries() {
+        // The overlap slice starts at current.len() - overlap_chars, which
+        // falls inside a 3-byte character for CJK text.
+        let para = "\u{5b57}".repeat(100);
+        let mut text = String::new();
+        for i in 0..8 {
+            if i > 0 {
+                text.push_str("\n\n");
+            }
+            text.push_str(&para);
+        }
+        let opts = ChunkOptions {
+            enabled: true,
+            split_by: SplitBy::Paragraph,
+            max_chars: 250,
+            overlap_chars: 100,
+        };
+        let chunks = chunk_text(&text, &opts);
+        assert!(chunks.len() > 1, "should produce multiple chunks, got {}", chunks.len());
+        for c in &chunks {
+            assert!(!c.is_empty(), "chunk should not be empty");
         }
     }
 
