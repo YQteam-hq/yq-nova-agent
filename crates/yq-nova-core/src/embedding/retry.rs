@@ -84,23 +84,30 @@ where
     Fut: std::future::Future<Output = Result<T, (RetryAction, E)>>,
     E: Into<anyhow::Error> + std::fmt::Display,
 {
+    // A zero attempt budget is a misconfiguration, not a reason to panic:
+    // treat it as "try once". Callers wire user-supplied config straight into
+    // this function, so it must never depend on the value being sane.
+    let max_attempts = config.max_attempts.max(1);
     let mut rng = MiniRng::new();
     let mut prev = config.base_sleep;
     let mut last_err: Option<anyhow::Error> = None;
 
-    for attempt in 1..=config.max_attempts {
+    for attempt in 1..=max_attempts {
         match body(attempt).await {
             Ok(v) => return Ok(v),
             Err((action, e)) => {
                 let e = e.into();
-                let is_last = attempt == config.max_attempts;
+                let is_last = attempt == max_attempts;
                 let will_retry = !is_last && action == RetryAction::Retry;
                 last_err = Some(e);
                 if !will_retry {
                     break;
                 }
 
-                let cap = (prev * 3).min(config.max_sleep);
+                // `max_sleep` may be configured below `base_sleep`; clamping
+                // the cap back up keeps the sampling window valid instead of
+                // tripping the `lo <= hi` assertion inside the rng.
+                let cap = prev.saturating_mul(3).min(config.max_sleep).max(config.base_sleep);
                 let sleep = rng.range_inclusive(config.base_sleep, cap);
                 prev = sleep;
                 tokio::time::sleep(sleep).await;
@@ -108,9 +115,9 @@ where
         }
     }
 
-    let last = last_err.expect("with_retry: zero attempts ran");
+    let last = last_err.expect("with_retry always runs at least one attempt");
     Err(crate::error::NovaError::embedding(
-        format!("embedding request failed after {} attempts", config.max_attempts),
+        format!("embedding request failed after {max_attempts} attempts"),
         last,
     ))
 }
@@ -194,5 +201,54 @@ mod tests {
         assert_eq!(classify_http_status(reqwest::StatusCode::BAD_REQUEST), RetryAction::Fail);
         assert_eq!(classify_http_status(reqwest::StatusCode::UNAUTHORIZED), RetryAction::Fail);
         assert_eq!(classify_http_status(reqwest::StatusCode::OK), RetryAction::Fail);
+    }
+
+    #[tokio::test]
+    async fn zero_max_attempts_runs_once_instead_of_panicking() {
+        let cfg = RetryConfig {
+            max_attempts: 0,
+            base_sleep: Duration::from_millis(1),
+            max_sleep: Duration::from_millis(2),
+            ..RetryConfig::default()
+        };
+        let calls = Cell::new(0u32);
+
+        let ok = with_retry(&cfg, |n| {
+            calls.set(calls.get() + 1);
+            async move { Ok::<u32, (RetryAction, anyhow::Error)>(n) }
+        })
+        .await
+        .expect("a zero attempt budget must still make one attempt");
+        assert_eq!(ok, 1);
+        assert_eq!(calls.get(), 1);
+
+        let err = with_retry(&cfg, |n| async move {
+            Err::<u32, _>((RetryAction::Retry, anyhow::anyhow!("boom {n}")))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), crate::error::ErrorCode::Embedding);
+        assert!(err.to_string().contains("after 1 attempts"), "message reflects the real budget");
+    }
+
+    #[tokio::test]
+    async fn base_sleep_above_max_sleep_does_not_panic() {
+        // An inverted sleep window used to trip the rng's `lo <= hi` assert on
+        // the first retry; it must clamp instead.
+        let cfg = RetryConfig {
+            max_attempts: 3,
+            base_sleep: Duration::from_millis(20),
+            max_sleep: Duration::from_millis(1),
+            ..RetryConfig::default()
+        };
+        let count = Cell::new(0u32);
+        let err = with_retry(&cfg, |n| {
+            count.set(n);
+            async move { Err::<u32, _>((RetryAction::Retry, anyhow::anyhow!("{n}"))) }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(count.get(), 3, "all attempts ran without panicking");
+        assert_eq!(err.code(), crate::error::ErrorCode::Embedding);
     }
 }

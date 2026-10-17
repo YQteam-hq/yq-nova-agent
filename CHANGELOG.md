@@ -2,6 +2,13 @@
 
 All notable changes to **yq-nova-agent** are documented in this file. The project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- `RetryConfig` with `max_attempts = 0` no longer panics: the attempt budget is clamped to one, so a misconfigured deployment retries once and reports an embedding error instead of aborting the request task. Callers relied on an error being returned here, never on the panic, so this is a bug fix rather than a behavior contract change.
+- A `RetryConfig` whose `base_sleep` exceeds `max_sleep` no longer panics on the first retry; the sleep window is clamped so the sampling range stays valid.
+- Retry backoff now uses saturating duration multiplication, so extreme `base_sleep` values cannot overflow.
+
 ## [0.4.0] - 2026-09-14
 
 ### Added
