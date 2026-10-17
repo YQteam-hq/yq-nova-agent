@@ -1,11 +1,43 @@
 
 from __future__ import annotations
 
+import copy
 import json
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional
+
+# A namespace travels in the `x-namespace` HTTP header, so only characters
+# that are safe inside a header value are accepted: the name must start with
+# an alphanumeric character and may then contain alphanumerics, hyphens and
+# underscores. This structurally rules out header injection (CR/LF/colon).
+_NAMESPACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+
+
+def _ensure_non_empty(name: str, where: str) -> str:
+    """Strip `name` and reject empty or whitespace-only input."""
+    cleaned = name.strip()
+    if not cleaned:
+        raise ValueError(f"{where}: name must not be empty")
+    return cleaned
+
+
+def _validate_namespace(name: str, where: str) -> str:
+    """Validate a tenant namespace name, returning it stripped.
+
+    Raises a ValueError whose message distinguishes empty input from a name
+    containing characters that are unsafe inside the `x-namespace` header.
+    """
+    cleaned = _ensure_non_empty(name, where)
+    if not _NAMESPACE_RE.match(cleaned):
+        raise ValueError(
+            f"{where}: {cleaned!r} contains invalid characters; a namespace "
+            "must start with a letter or digit and may then contain only "
+            "letters, digits, hyphens and underscores"
+        )
+    return cleaned
 
 class NovaApiError(Exception):
 
@@ -32,6 +64,7 @@ class Client:
         base_url: str,
         api_key: Optional[str] = None,
         timeout: float = 30.0,
+        namespace: str = "default",
     ) -> None:
         base = base_url.rstrip("/")
         if not base:
@@ -39,6 +72,15 @@ class Client:
         self.base_url = base
         self.api_key = api_key
         self.timeout = timeout
+        self.namespace = _validate_namespace(namespace, "namespace")
+
+    def with_namespace(self, name: str) -> "Client":
+        """Return a copy of this client scoped to another namespace."""
+        # Copying the instance keeps every configuration attribute (including
+        # any added in the future) instead of re-listing them here.
+        clone = copy.copy(self)
+        clone.namespace = _validate_namespace(name, "with_namespace")
+        return clone
 
     def _request(
         self,
@@ -55,6 +97,7 @@ class Client:
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
+            "x-namespace": self.namespace,
         }
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"

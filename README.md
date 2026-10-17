@@ -227,6 +227,10 @@ client.remember_batch([{"content": "first"}, {"content": "second"}])
 client.list_tags(limit=100)
 client.rename_tag("nova", "yq-nova")
 client.delete_tag("yq-nova")
+
+# Multi-tenant: bind a namespace (x-namespace header) or derive a scoped copy
+team_client = Client("http://127.0.0.1:7999", namespace="team-a")
+scoped = client.with_namespace("team-a")
 ```
 
 ### MCP tools

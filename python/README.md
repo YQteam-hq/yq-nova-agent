@@ -52,6 +52,30 @@ print(client.get_memory(uuid))
 client.delete_memory(uuid)
 ```
 
+## Multi-tenant namespaces
+
+Every request carries an `x-namespace` header. The default namespace is
+`default`, so single-tenant deployments need no changes:
+
+```python
+from yq_nova import Client
+
+# Bind the namespace when constructing the client
+team_client = Client("http://127.0.0.1:7999", namespace="team-a")
+team_client.remember("team-a memory")
+
+# Or derive a scoped copy from an existing client; the original stays untouched
+scoped = team_client.with_namespace("team-b")
+print(scoped.namespace)  # team-b
+print(team_client.namespace)  # team-a
+```
+
+Namespace names are validated before they reach the `x-namespace` header:
+they must start with a letter or digit and may then contain only letters,
+digits, hyphens and underscores. Empty, blank or otherwise unsafe names
+(for example names containing spaces, colons or newlines) raise
+`ValueError`.
+
 ## Graph operations
 
 ```python
