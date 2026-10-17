@@ -192,7 +192,8 @@ mod tests {
         namespace_keys: std::collections::BTreeMap<String, String>,
         seed_namespaces: &[&str],
     ) -> axum::Router {
-        let (router, _db) = make_router_full_with_db(auth_token, namespace_keys, seed_namespaces).await;
+        let (router, _db) =
+            make_router_full_with_db(auth_token, namespace_keys, seed_namespaces).await;
         router
     }
 
@@ -261,7 +262,8 @@ mod tests {
         let resp = router.oneshot(req).await.unwrap();
         let status = resp.status();
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        let json: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
         (status, json)
     }
 
@@ -449,11 +451,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert!(
-            out["hits"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|h| h["memory"]["uuid"] == secret),
+            out["hits"].as_array().unwrap().iter().any(|h| h["memory"]["uuid"] == secret),
             "tenant-a should recall its own memory"
         );
 
@@ -512,13 +510,9 @@ mod tests {
         );
 
         // tenant-a still sees its own memory.
-        let (status, out) = post_json(
-            router.clone(),
-            "/v1/memory/list",
-            "key-a",
-            serde_json::json!({"limit": 50}),
-        )
-        .await;
+        let (status, out) =
+            post_json(router.clone(), "/v1/memory/list", "key-a", serde_json::json!({"limit": 50}))
+                .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(out["total"], 1, "tenant-a should list its own memory, got: {out}");
     }
