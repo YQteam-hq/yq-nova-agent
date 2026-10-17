@@ -62,6 +62,12 @@ fn default_overlap_chars() -> usize {
     150
 }
 
+/// Split `text` into chunks according to `opts`.
+///
+/// This is the entry point used by the memory `remember` flow whenever
+/// `ChunkOptions::enabled` is true, so both split modes below must never
+/// panic on non-ASCII input: user-supplied text routinely contains CJK,
+/// emoji and combining marks.
 pub fn chunk_text(text: &str, opts: &ChunkOptions) -> Vec<String> {
     if text.is_empty() {
         return Vec::new();
@@ -99,11 +105,11 @@ fn chunk_by_paragraph(text: &str, max_chars: usize, overlap_chars: usize) -> Vec
                 // boundary, otherwise a multi-byte character can be split
                 // and the slice panics.
                 let take = overlap_chars.min(current.len());
-                let mut cut = current.len() - take;
-                while !current.is_char_boundary(cut) {
-                    cut += 1;
+                let mut overlap_start = current.len() - take;
+                while !current.is_char_boundary(overlap_start) {
+                    overlap_start += 1;
                 }
-                current = current[cut..].to_string();
+                current = current[overlap_start..].to_string();
                 current.push_str("\n\n");
                 current.push_str(trimmed);
             } else {
@@ -133,8 +139,12 @@ fn chunk_by_char(text: &str, max_chars: usize, overlap_chars: usize) -> Vec<Stri
     let step = max_chars.saturating_sub(overlap_chars);
     let step = if step == 0 { 1 } else { step };
 
-    // Pre-compute char boundaries for safe slicing. This adds O(n) time and
-    // space complexity but prevents panics on multi-byte UTF-8 characters.
+    // Pre-compute char boundaries for safe slicing. This trades O(n) extra
+    // time and space for panic-free chunks: the alternative of walking
+    // `is_char_boundary` for every window would re-scan the text once per
+    // chunk and is easier to get wrong. For mostly-ASCII text the table is
+    // one byte offset per character, which is cheap relative to the copies
+    // the chunking already performs.
     let mut char_bounds: Vec<usize> = Vec::with_capacity(total_chars + 1);
     char_bounds.extend(text.char_indices().map(|(byte_idx, _)| byte_idx));
     char_bounds.push(text.len());
@@ -347,6 +357,38 @@ mod tests {
         assert!(chunks.len() > 1, "should produce multiple chunks, got {}", chunks.len());
         for c in &chunks {
             assert!(!c.is_empty(), "chunk should not be empty");
+            // Every retained character must be complete: only the CJK
+            // character itself and the paragraph separator may appear.
+            assert!(
+                c.chars().all(|ch| ch == '\u{5b57}' || ch == '\n'),
+                "chunk should contain only complete characters: {:?}",
+                c
+            );
+        }
+    }
+
+    #[test]
+    fn chunk_by_char_handles_4byte_characters_with_overlap() {
+        // Emoji are 4 bytes each and the overlap window has to land on a
+        // char boundary as well, otherwise the slice panics.
+        let text = "\u{1f389}".repeat(300);
+        let opts = ChunkOptions {
+            enabled: true,
+            split_by: SplitBy::Char,
+            max_chars: 200,
+            overlap_chars: 50,
+        };
+        let chunks = chunk_text(&text, &opts);
+        assert_eq!(chunks.len(), 2, "expected two chunks, got {}", chunks.len());
+        assert_eq!(chunks[0].chars().count(), 200);
+        assert_eq!(chunks[1].chars().count(), 150);
+        for c in &chunks {
+            assert!(!c.is_empty(), "chunk should not be empty");
+            assert!(
+                c.chars().all(|ch| ch == '\u{1f389}'),
+                "chunk should contain only complete emoji: {:?}",
+                c
+            );
         }
     }
 
