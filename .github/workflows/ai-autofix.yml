@@ -28,7 +28,7 @@ permissions:
   pull-requests: write
 
 concurrency:
-  group: ai-glm-single
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: false
 
 jobs:
