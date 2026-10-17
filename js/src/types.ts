@@ -343,3 +343,42 @@ export interface StatsOutput {
   relation_count: number;
   tag_count: number;
 }
+export interface NamespaceRecord {
+  id: number;
+  uuid: string;
+  name: string;
+  description: string | null;
+  config: unknown;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface NamespaceListOutput {
+  total: number;
+  count: number;
+  limit: number;
+  offset: number;
+  items: NamespaceRecord[];
+}
+
+export interface ListNamespacesParams {
+  limit?: number;
+  offset?: number;
+}
+
+export interface CreateNamespaceInput {
+  name: string;
+  description?: string;
+  config?: Record<string, unknown>;
+}
+
+export interface UpdateNamespaceInput {
+  description?: string;
+  config?: Record<string, unknown>;
+}
+
+export interface DeleteNamespaceOutput {
+  name: string;
+  deleted: boolean;
+  protected: boolean;
+}
