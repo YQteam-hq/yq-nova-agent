@@ -52,7 +52,7 @@ jobs:
           MAX_FILES: ${{ github.event.inputs.max_files || '3' }}
         run: |
           python3 - <<'PY'
-          import os, json, subprocess, urllib.request, pathlib, sys
+          import os, json, subprocess, urllib.request, urllib.error, pathlib, sys, time
 
           KEY = (os.environ.get("GLM_API_KEY") or "").strip()
           MODEL = os.environ.get("GLM_MODEL", "glm-4.5-flash")
@@ -95,16 +95,51 @@ jobs:
               print("No candidate files.")
               sys.exit(0)
 
-          def call(messages):
-              req = urllib.request.Request(
-                  ENDPOINT,
-                  data=json.dumps({"model": MODEL, "messages": messages,
-                                   "temperature": 0.2, "max_tokens": 4000}).encode(),
-                  headers={"Content-Type": "application/json", "Authorization": "Bearer " + KEY},
+          def is_rate_limited(e):
+              body = ""
+              if isinstance(e, urllib.error.HTTPError):
+                  try:
+                      body = e.read().decode(errors="replace")
+                  except Exception:
+                      body = ""
+              return isinstance(e, urllib.error.HTTPError) and (
+                  e.code == 429 or "1302" in body or "rate limit" in body.lower()
+                  or "too many requests" in body.lower() or "速率" in body
               )
-              with urllib.request.urlopen(req, timeout=120) as r:
-                  data = json.loads(r.read().decode())
-              return data["choices"][0]["message"]["content"]
+
+          def call(messages):
+              # Two-level retry ("circuit breaker"): a round is the fast backoff
+              # loop below. If a whole round keeps failing because the API returns
+              # error codes (429 / 5xx), cool down for 5 minutes and start a new
+              # round, so long rate-limit windows are survived instead of failing
+              # closed after the first round.
+              attempts = int(os.environ.get("ATTEMPTS", "6") or "6")
+              rounds = int(os.environ.get("ROUNDS", "3") or "3")
+              cooldown = 5 * 60
+              last_err = None
+              for rnd in range(1, rounds + 1):
+                  for i in range(attempts):
+                      try:
+                          req = urllib.request.Request(
+                              ENDPOINT,
+                              data=json.dumps({"model": MODEL, "messages": messages,
+                                               "temperature": 0.2, "max_tokens": 4000}).encode(),
+                              headers={"Content-Type": "application/json", "Authorization": "Bearer " + KEY},
+                          )
+                          with urllib.request.urlopen(req, timeout=60) as r:
+                              data = json.loads(r.read().decode())
+                          return data["choices"][0]["message"]["content"]
+                      except Exception as e:
+                          last_err = e
+                          print(f"[retry] attempt {i+1}/{attempts} (round {rnd}/{rounds}) failed: {e}", flush=True)
+                          if i < attempts - 1:
+                              wait = min(120, 30 * (2 ** i)) if is_rate_limited(e) else 2 * (2 ** i)
+                              print(f"[retry] waiting {wait}s before retry", flush=True)
+                              time.sleep(wait)
+                  if rnd < rounds and isinstance(last_err, urllib.error.HTTPError):
+                      print(f"[retry] round {rnd} failed with API error codes; cooling down 5 minutes before the next round.", flush=True)
+                      time.sleep(cooldown)
+              raise last_err
 
           changed = []
           for f, text in cands[:MAX_FILES]:
