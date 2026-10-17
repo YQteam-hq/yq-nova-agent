@@ -12,10 +12,18 @@ use yq_nova_core::{
         RememberOutput, TagDeleteInput, TagDeleteOutput, TagListInput, TagListOutput,
         TagRenameInput, TagRenameOutput, UpdateInput, ops_forget, ops_recall, ops_remember,
     },
-    storage::{Database, MemoryRecord, entity::EntityRepository},
+    storage::{
+        Database, MemoryRecord, RelationRecord,
+        entity::{EntityRecord, EntityRepository},
+        relation::RelationRepository,
+    },
 };
 
 use crate::http_client;
+
+/// Upper bound applied to a single page of graph query results, mirroring the
+/// `.min(500)` clamp the HTTP handlers perform on `limit`.
+const MAX_GRAPH_PAGE: usize = 500;
 
 #[derive(Clone)]
 pub struct EmbeddedNova {
@@ -263,6 +271,128 @@ impl EmbeddedNova {
             outcome,
             entity,
         })
+    }
+
+    pub async fn list_entities(
+        &self,
+        name_prefix: Option<&str>,
+        entity_type: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> NovaResult<Vec<EntityRecord>> {
+        // Empty filter strings are treated as "no filter" so that a caller
+        // passing `Some("")` gets the unfiltered page, matching the HTTP
+        // client's behaviour.
+        let name_prefix = name_prefix.filter(|s| !s.is_empty());
+        let entity_type = entity_type.filter(|s| !s.is_empty());
+        self.graph
+            .entity_repo
+            .list(
+                &self.graph.database,
+                yq_nova_core::storage::namespace::DEFAULT_NAMESPACE_ID,
+                name_prefix,
+                entity_type,
+                limit.min(MAX_GRAPH_PAGE),
+                offset,
+            )
+            .await
+    }
+
+    pub async fn upsert_relation(
+        &self,
+        req: http_client::UpsertRelationRequest,
+    ) -> NovaResult<http_client::UpsertRelationResponse> {
+        if req.source_uuid.is_nil() || req.target_uuid.is_nil() {
+            return Err(NovaError::validation("upsert_relation: source_uuid/target_uuid required"));
+        }
+        let predicate = req.predicate.trim();
+        if predicate.is_empty() {
+            return Err(NovaError::validation("upsert_relation: predicate required"));
+        }
+        let db = &self.graph.database;
+        let namespace_id = yq_nova_core::storage::namespace::DEFAULT_NAMESPACE_ID;
+        let outcome = self
+            .graph
+            .relation_repo
+            .insert(
+                db,
+                yq_nova_core::storage::relation::InsertRelationInput {
+                    namespace_id,
+                    source_uuid: req.source_uuid,
+                    target_uuid: req.target_uuid,
+                    predicate,
+                    confidence: req.confidence,
+                    memory_uuid: req.memory_uuid,
+                    metadata: req.metadata.as_ref(),
+                    idempotent: req.idempotent,
+                },
+            )
+            .await?;
+        let relation_uuid = outcome.uuid();
+        let relation =
+            self.graph.relation_repo.get_by_uuid(db, namespace_id, relation_uuid).await?;
+        Ok(http_client::UpsertRelationResponse {
+            inserted: matches!(
+                outcome,
+                yq_nova_core::storage::relation::InsertRelationOutcome::Inserted(_)
+            ),
+            updated: matches!(
+                outcome,
+                yq_nova_core::storage::relation::InsertRelationOutcome::Updated(_)
+            ),
+            relation_uuid,
+            relation,
+        })
+    }
+
+    pub async fn list_relations(
+        &self,
+        source: Option<Uuid>,
+        target: Option<Uuid>,
+        predicate: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> NovaResult<Vec<RelationRecord>> {
+        let db = &self.graph.database;
+        let ns = yq_nova_core::storage::namespace::DEFAULT_NAMESPACE_ID;
+        // Fetch limit+offset rows before slicing so that offset behaves the
+        // same way it does over HTTP pagination.
+        let total_limit = limit.min(MAX_GRAPH_PAGE).saturating_add(offset);
+        let predicate = predicate.filter(|s| !s.is_empty());
+
+        let mut rows: Vec<RelationRecord> = Vec::new();
+        if let Some(src) = source {
+            let got =
+                self.graph.relation_repo.list_outgoing(db, ns, src, predicate, total_limit).await?;
+            match target {
+                // Both endpoints given narrows the outgoing set further.
+                Some(tgt) => rows.extend(got.into_iter().filter(|r| r.target_uuid == tgt)),
+                None => rows = got,
+            }
+        } else if let Some(tgt) = target {
+            rows =
+                self.graph.relation_repo.list_incoming(db, ns, tgt, predicate, total_limit).await?;
+        } else {
+            // Neither endpoint given: walk the entity table and collect each
+            // entity's outgoing edges, newest first, then de-duplicate because
+            // a self-loop would otherwise be seen twice.
+            let ents = self.graph.entity_repo.list(db, ns, None, None, MAX_GRAPH_PAGE, 0).await?;
+            for e in ents {
+                if rows.len() >= total_limit {
+                    break;
+                }
+                let mut got = self
+                    .graph
+                    .relation_repo
+                    .list_outgoing(db, ns, e.uuid, predicate, total_limit)
+                    .await?;
+                rows.append(&mut got);
+            }
+            rows.sort_by_key(|r| std::cmp::Reverse(r.id));
+            rows.dedup_by_key(|r| r.id);
+        }
+
+        Ok(rows.into_iter().skip(offset).take(limit).collect())
     }
 
     pub async fn traverse(
