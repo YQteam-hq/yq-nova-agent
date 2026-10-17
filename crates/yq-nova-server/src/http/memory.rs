@@ -132,9 +132,10 @@ pub async fn recall(
 ) -> Result<Json<RecallOutput>> {
     let svc: &MemoryService = &state.memory;
     let mut filter = req.filter.clone();
-    if filter.namespace_id.is_none() {
-        filter.namespace_id = Some(ns.id);
-    }
+    // The authenticated namespace always wins: a client-supplied
+    // `filter.namespace_id` must never be able to read another tenant's
+    // memories. Every other handler already forces `ns.id`; recall must too.
+    filter.namespace_id = Some(ns.id);
     let input = RecallInput {
         query: &req.query,
         top_k: req.top_k,
@@ -161,9 +162,10 @@ pub async fn list_memories(
 ) -> Result<Json<ListOutput>> {
     let svc: &MemoryService = &state.memory;
     let mut req = req;
-    if req.filter.namespace_id.is_none() {
-        req.filter.namespace_id = Some(ns.id);
-    }
+    // The authenticated namespace always wins: a client-supplied
+    // `filter.namespace_id` must never be able to list another tenant's
+    // memories. Every other handler already forces `ns.id`; list must too.
+    req.filter.namespace_id = Some(ns.id);
     let out = svc.list_memories(req).await?;
     Ok(Json(out))
 }
