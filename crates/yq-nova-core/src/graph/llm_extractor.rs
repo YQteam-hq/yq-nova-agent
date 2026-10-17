@@ -5,7 +5,10 @@ use serde::{Deserialize, Serialize};
 
 use super::extractor::{EntityCandidate, EntityExtractor, Extraction, RelationCandidate};
 use crate::{
-    embedding::{retry::{RetryAction, RetryConfig, classify_http_status, with_retry}, truncate_utf8},
+    embedding::{
+        retry::{RetryAction, RetryConfig, classify_http_status, with_retry},
+        truncate_utf8,
+    },
     error::{NovaError, NovaResult},
 };
 

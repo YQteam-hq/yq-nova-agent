@@ -186,10 +186,12 @@ mod tests {
         // A byte-index slice like `&text[..400]` panics when index 400 falls
         // inside a multi-byte character; provider error bodies routinely
         // contain non-ASCII text, so truncation must respect char boundaries.
-        let cjk = "错".repeat(300); // 300 chars, 900 bytes
+        // U+9519 is a 3-byte code point, so 300 of them occupy 900 bytes and a
+        // naive byte-400 cut lands inside a character.
+        let cjk = "\u{9519}".repeat(300);
         let out = truncate_utf8(&cjk, 400);
         assert!(out.len() <= 400, "byte budget respected");
-        assert!(out.chars().all(|c| c == '错'), "only whole characters kept");
+        assert!(out.chars().all(|c| c == '\u{9519}'), "only whole characters kept");
         assert_eq!(out.chars().count(), 133, "400 bytes fit exactly 133 3-byte chars");
 
         // Exactly-on-boundary lengths and short inputs are untouched.
@@ -198,10 +200,10 @@ mod tests {
         assert_eq!(truncate_utf8("short", 400), "short");
         assert_eq!(truncate_utf8("", 400), "");
 
-        // Emoji (4 bytes each) behave the same way.
-        let emoji = "😀".repeat(150); // 600 bytes
+        // Four-byte characters behave the same way.
+        let emoji = "\u{1f600}".repeat(150); // 600 bytes
         let out = truncate_utf8(&emoji, 400);
         assert_eq!(out.chars().count(), 100);
-        assert!(out.chars().all(|c| c == '😀'));
+        assert!(out.chars().all(|c| c == '\u{1f600}'));
     }
 }
