@@ -176,6 +176,12 @@ export interface ExportInput {
   offset?: number;
 }
 
+export interface ExportOutput {
+  count: number;
+  offset: number;
+  items: MemoryRecord[];
+}
+
 export interface ImportInput {
   items: Array<Record<string, JsonValue>>;
   embed?: boolean;
@@ -230,6 +236,17 @@ export interface ListTagsParams {
   offset?: number;
 }
 
+export interface TagRenameOutput {
+  name: string;
+  new_name: string;
+}
+
+export interface TagDeleteOutput {
+  name: string;
+  deleted: boolean;
+  affected_memories: number;
+}
+
 export interface EntityRecord {
   id: number;
   uuid: string;
@@ -268,7 +285,8 @@ export interface MergeEntitiesInput {
 
 export interface MergeEntitiesOutput {
   kept_uuid: string;
-  discard_uuids: string[];
+  merged: string[];
+  remapped_relations: number;
 }
 
 export interface RelationRecord {
@@ -316,6 +334,14 @@ export interface TraverseInput {
   min_confidence?: number;
 }
 
+/** One node reached by a graph traversal. */
+export interface TraverseNode {
+  entity: EntityRecord;
+  depth: number;
+  /** Entity uuids from the traversal start up to and including this node. */
+  path: string[];
+}
+
 export interface ExtractLinkInput {
   text: string;
   opts?: {
@@ -324,6 +350,21 @@ export interface ExtractLinkInput {
     create_relations?: boolean;
     min_confidence?: number;
   };
+}
+
+/** An entity the extractor proposed, paired with the uuid it resolved to. */
+export interface EntityCandidate {
+  name: string;
+  entity_type: string;
+  description: string | null;
+}
+
+export interface ExtractLinkOutput {
+  /** Tuples of (candidate, uuid) as serialized by the server. */
+  entities: Array<[EntityCandidate, string]>;
+  entities_upserted: number;
+  relations_created: number;
+  tags: string[];
 }
 
 export interface HealthOutput {
@@ -342,4 +383,43 @@ export interface StatsOutput {
   entity_count: number;
   relation_count: number;
   tag_count: number;
+}
+export interface NamespaceRecord {
+  id: number;
+  uuid: string;
+  name: string;
+  description: string | null;
+  config: unknown;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface NamespaceListOutput {
+  total: number;
+  count: number;
+  limit: number;
+  offset: number;
+  items: NamespaceRecord[];
+}
+
+export interface ListNamespacesParams {
+  limit?: number;
+  offset?: number;
+}
+
+export interface CreateNamespaceInput {
+  name: string;
+  description?: string;
+  config?: Record<string, unknown>;
+}
+
+export interface UpdateNamespaceInput {
+  description?: string;
+  config?: Record<string, unknown>;
+}
+
+export interface DeleteNamespaceOutput {
+  name: string;
+  deleted: boolean;
+  protected: boolean;
 }

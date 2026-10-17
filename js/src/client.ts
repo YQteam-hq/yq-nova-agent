@@ -1,9 +1,13 @@
 import type {
   BatchRememberInput,
   BatchRememberOutput,
+  CreateNamespaceInput,
+  DeleteNamespaceOutput,
   EntityRecord,
   ExportInput,
+  ExportOutput,
   ExtractLinkInput,
+  ExtractLinkOutput,
   ForgetInput,
   ForgetOutput,
   HealthOutput,
@@ -11,6 +15,7 @@ import type {
   ImportOutput,
   ListEntitiesParams,
   ListInput,
+  ListNamespacesParams,
   ListOutput,
   ListRelationsParams,
   ListTagsParams,
@@ -19,15 +24,21 @@ import type {
   MergeInput,
   MergeOutput,
   MemoryRecord,
+  NamespaceListOutput,
+  NamespaceRecord,
   RecallInput,
   RecallOutput,
   RememberInput,
   RememberOutput,
   RelationRecord,
   StatsOutput,
+  TagDeleteOutput,
   TagListOutput,
+  TagRenameOutput,
   TraverseInput,
+  TraverseNode,
   UpdateMemoryInput,
+  UpdateNamespaceInput,
   UpsertEntityInput,
   UpsertEntityOutput,
   UpsertRelationInput,
@@ -183,7 +194,7 @@ export class NovaClient {
   }
 
   exportMemories(input: ExportInput = {}) {
-    return this.request<Record<string, unknown>>("POST", "/v1/memory/export", input);
+    return this.request<ExportOutput>("POST", "/v1/memory/export", input);
   }
 
   importMemories(input: ImportInput) {
@@ -199,11 +210,11 @@ export class NovaClient {
   }
 
   renameTag(name: string, newName: string) {
-    return this.request<Record<string, unknown>>("PATCH", `/v1/tags/${this.quote(name)}`, { new_name: newName });
+    return this.request<TagRenameOutput>("PATCH", `/v1/tags/${this.quote(name)}`, { new_name: newName });
   }
 
   deleteTag(name: string) {
-    return this.request<Record<string, unknown>>("DELETE", `/v1/tags/${this.quote(name)}`);
+    return this.request<TagDeleteOutput>("DELETE", `/v1/tags/${this.quote(name)}`);
   }
 
   upsertEntity(input: UpsertEntityInput) {
@@ -227,11 +238,72 @@ export class NovaClient {
   }
 
   traverse(input: TraverseInput) {
-    return this.request<Array<Record<string, unknown>>>("POST", "/v1/graph/traverse", input);
+    return this.request<TraverseNode[]>("POST", "/v1/graph/traverse", input);
   }
 
   extractAndLink(input: ExtractLinkInput) {
-    return this.request<Record<string, unknown>>("POST", "/v1/graph/extract-and-link", input);
+    return this.request<ExtractLinkOutput>("POST", "/v1/graph/extract-and-link", input);
+  }
+
+  // ------------------------------------------------------------------
+  // Namespace management (admin).
+  //
+  // These routes require an admin-scoped API key; a tenant-scoped key gets
+  // 403. The `x-namespace` header still rides along on every call because
+  // the auth middleware needs it to resolve the calling scope.
+  // ------------------------------------------------------------------
+
+  /** List tenant namespaces. */
+  listNamespaces(params: ListNamespacesParams = {}) {
+    return this.request<NamespaceListOutput>("GET", "/v1/namespaces", undefined, params);
+  }
+
+  /** Fetch a single namespace by name. */
+  getNamespace(name: string) {
+    const cleaned = ensureNonEmptyName(name, "getNamespace");
+    return this.request<NamespaceRecord>("GET", `/v1/namespaces/${this.quote(cleaned)}`);
+  }
+
+  /**
+   * Create a tenant namespace.
+   *
+   * The name is validated against the same rule `withNamespace` uses, so any
+   * namespace created here can immediately be scoped to. The reserved name
+   * `default` cannot be created.
+   */
+  createNamespace(input: CreateNamespaceInput) {
+    const name = validateNamespace(input.name, "createNamespace");
+    if (name.toLowerCase() === "default") {
+      throw new Error("createNamespace: 'default' is a reserved name");
+    }
+    const body = {
+      name,
+      description: input.description ?? null,
+      config: input.config ?? {},
+    };
+    return this.request<NamespaceRecord>("POST", "/v1/namespaces", body);
+  }
+
+  /**
+   * Update a namespace description and/or config.
+   *
+   * Only the fields present in `input` are sent; the server keeps the stored
+   * value for anything omitted. There is no rename operation.
+   */
+  updateNamespace(name: string, input: UpdateNamespaceInput = {}) {
+    const cleaned = ensureNonEmptyName(name, "updateNamespace");
+    return this.request<NamespaceRecord>("PATCH", `/v1/namespaces/${this.quote(cleaned)}`, input);
+  }
+
+  /**
+   * Delete a namespace.
+   *
+   * The built-in `default` namespace is protected; the response reports
+   * `protected: true` when the server declines to remove it.
+   */
+  deleteNamespace(name: string) {
+    const cleaned = ensureNonEmptyName(name, "deleteNamespace");
+    return this.request<DeleteNamespaceOutput>("DELETE", `/v1/namespaces/${this.quote(cleaned)}`);
   }
 
   private async request<T>(
