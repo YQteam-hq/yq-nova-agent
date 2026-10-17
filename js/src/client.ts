@@ -118,7 +118,11 @@ export class NovaClient {
     }
     this.baseUrl = base;
     this.apiKey = options.apiKey;
-    this.timeoutMs = validateTimeout(options.timeoutMs ?? 30000);
+    // The default applies only when the caller omits the option; whatever is
+    // used afterwards has been through validateTimeout, which throws on NaN,
+    // Infinity and negative input.
+    const timeoutMs = options.timeoutMs ?? 30000;
+    this.timeoutMs = validateTimeout(timeoutMs);
     this.namespace = validateNamespace(options.namespace ?? "default", "namespace");
     this.fetchImpl = options.fetch ?? ((typeof globalThis !== "undefined" && globalThis.fetch) as typeof fetch);
     if (!this.fetchImpl) {
