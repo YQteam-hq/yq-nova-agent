@@ -68,9 +68,41 @@ def test_namespace_scoping():
     except ValueError:
         pass
 
+def test_namespace_rejects_unsafe_characters():
+    # The namespace is sent in the x-namespace header, so characters that
+    # could split or forge a header must be rejected.
+    client = Client("http://127.0.0.1:7999")
+    unsafe = [
+        "team\na",              # newline injection
+        "team\r\nX-Evil: 1",    # CRLF header splitting
+        "team a",               # space inside the name
+        "team:a",               # colon
+        "-team",                # must start alphanumeric
+        "team/../etc",          # path characters
+        "t\u00e9am",            # non-ASCII letter
+        "team\x00",             # NUL byte
+    ]
+    for name in unsafe:
+        try:
+            Client("http://127.0.0.1:7999", namespace=name)
+            assert False, f"expected ValueError for namespace {name!r}"
+        except ValueError:
+            pass
+        try:
+            client.with_namespace(name)
+            assert False, f"expected ValueError for with_namespace({name!r})"
+        except ValueError:
+            pass
+
+    # Safe names are accepted and stripped.
+    for name in ["team-a", "team_b", "Team9", "  padded  "]:
+        c = Client("http://127.0.0.1:7999", namespace=name)
+        assert c.namespace == name.strip()
+
 if __name__ == "__main__":
     test_imports_and_construction()
     test_error_type_attributes()
     test_client_side_validation()
     test_namespace_scoping()
+    test_namespace_rejects_unsafe_characters()
     print("all smoke tests passed")

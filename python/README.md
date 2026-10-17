@@ -70,6 +70,12 @@ print(scoped.namespace)  # team-b
 print(team_client.namespace)  # team-a
 ```
 
+Namespace names are validated before they reach the `x-namespace` header:
+they must start with a letter or digit and may then contain only letters,
+digits, hyphens and underscores. Empty, blank or otherwise unsafe names
+(for example names containing spaces, colons or newlines) raise
+`ValueError`.
+
 ## Graph operations
 
 ```python

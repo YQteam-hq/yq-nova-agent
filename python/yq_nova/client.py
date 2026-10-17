@@ -2,10 +2,30 @@
 from __future__ import annotations
 
 import json
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional
+
+# A namespace travels in the `x-namespace` HTTP header, so only characters
+# that are safe inside a header value are accepted: the name must start with
+# an alphanumeric character and may then contain alphanumerics, hyphens and
+# underscores. This structurally rules out header injection (CR/LF/colon).
+_NAMESPACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+
+
+def _validate_namespace(name: str, where: str) -> str:
+    """Validate a tenant namespace name, returning it stripped."""
+    if not name or not name.strip():
+        raise ValueError(f"{where}: name must not be empty")
+    cleaned = name.strip()
+    if not _NAMESPACE_RE.match(cleaned):
+        raise ValueError(
+            f"{where}: name must start with a letter or digit and contain "
+            "only letters, digits, hyphens and underscores"
+        )
+    return cleaned
 
 class NovaApiError(Exception):
 
@@ -37,22 +57,18 @@ class Client:
         base = base_url.rstrip("/")
         if not base:
             raise ValueError("base_url must not be empty")
-        if not namespace or not namespace.strip():
-            raise ValueError("namespace must not be empty")
         self.base_url = base
         self.api_key = api_key
         self.timeout = timeout
-        self.namespace = namespace
+        self.namespace = _validate_namespace(namespace, "namespace")
 
     def with_namespace(self, name: str) -> "Client":
         """Return a copy of this client scoped to another namespace."""
-        if not name or not name.strip():
-            raise ValueError("with_namespace: name must be non-empty")
         return Client(
             self.base_url,
             api_key=self.api_key,
             timeout=self.timeout,
-            namespace=name,
+            namespace=_validate_namespace(name, "with_namespace"),
         )
 
     def _request(
