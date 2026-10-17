@@ -215,3 +215,110 @@ test("invalid timeoutMs is rejected", () => {
     );
   }
 });
+test("listNamespaces passes pagination params to the namespaced route", async () => {
+  const { client, calls } = recordClient({ body: { total: 0, count: 0, limit: 25, offset: 50, items: [] } });
+  const out = await client.listNamespaces({ limit: 25, offset: 50 });
+  assert.equal(out.count, 0);
+  assert.equal(calls[0].url, "http://127.0.0.1:7999/v1/namespaces?limit=25&offset=50");
+  assert.equal(calls[0].init.method, "GET");
+  // The header is still required by the auth middleware to resolve the scope.
+  assert.equal(calls[0].init.headers["x-namespace"], "default");
+});
+
+test("getNamespace percent-encodes the name", async () => {
+  const { client, calls } = recordClient({ body: { id: 1, name: "team a/b" } });
+  await client.getNamespace("team a/b");
+  // Reserved characters must not be able to reshape the request path.
+  assert.equal(calls[0].url, "http://127.0.0.1:7999/v1/namespaces/team%20a%2Fb");
+  assert.equal(calls[0].init.method, "GET");
+});
+
+test("createNamespace posts name, description and config", async () => {
+  const { client, calls } = recordClient({ body: { id: 7, name: "team-a" } });
+  await client.createNamespace({ name: "team-a", description: "Team A", config: { tier: "gold" } });
+  assert.equal(calls[0].url, "http://127.0.0.1:7999/v1/namespaces");
+  assert.equal(calls[0].init.method, "POST");
+  assert.deepEqual(JSON.parse(calls[0].init.body), {
+    name: "team-a",
+    description: "Team A",
+    config: { tier: "gold" },
+  });
+});
+
+test("createNamespace defaults description to null and config to an empty object", async () => {
+  const { client, calls } = recordClient({ body: { id: 8, name: "team-b" } });
+  await client.createNamespace({ name: "team-b" });
+  assert.deepEqual(JSON.parse(calls[0].init.body), {
+    name: "team-b",
+    description: null,
+    config: {},
+  });
+});
+
+test("createNamespace rejects the reserved name and unsafe characters", () => {
+  const { client, calls } = recordClient();
+  const reserved = ["default", "Default", "DEFAULT"];
+  for (const name of reserved) {
+    assert.throws(
+      () => client.createNamespace({ name }),
+      /'default' is a reserved name/,
+      `expected rejection for reserved name ${name}`,
+    );
+  }
+  for (const name of ["team a", "-team", "team\r\nX", ""]) {
+    assert.throws(
+      () => client.createNamespace({ name }),
+      /createNamespace|reserved/,
+      `expected rejection for unsafe name ${JSON.stringify(name)}`,
+    );
+  }
+  assert.equal(calls.length, 0, "rejected names must not reach the transport");
+});
+
+test("createNamespace strips surrounding whitespace", async () => {
+  const { client, calls } = recordClient({ body: { id: 9, name: "team-c" } });
+  await client.createNamespace({ name: "  team-c  " });
+  assert.equal(JSON.parse(calls[0].init.body).name, "team-c");
+});
+
+test("updateNamespace sends only the fields provided", async () => {
+  const { client, calls } = recordClient({ body: { id: 7, name: "team-a" } });
+
+  await client.updateNamespace("team-a", { description: "Updated" });
+  assert.equal(calls[0].init.method, "PATCH");
+  assert.equal(calls[0].url, "http://127.0.0.1:7999/v1/namespaces/team-a");
+  assert.deepEqual(JSON.parse(calls[0].init.body), { description: "Updated" });
+
+  await client.updateNamespace("team-a", { config: { tier: "silver" } });
+  assert.deepEqual(JSON.parse(calls[1].init.body), { config: { tier: "silver" } });
+
+  await client.updateNamespace("team-a", { description: "Both", config: { k: 1 } });
+  assert.deepEqual(JSON.parse(calls[2].init.body), { description: "Both", config: { k: 1 } });
+});
+
+test("updateNamespace rejects an empty name", () => {
+  const { client, calls } = recordClient();
+  assert.throws(() => client.updateNamespace("   "), /updateNamespace: name must not be empty/);
+  assert.equal(calls.length, 0);
+});
+
+test("deleteNamespace issues a DELETE and surfaces the protected flag", async () => {
+  const { client, calls } = recordClient({ body: { name: "default", deleted: false, protected: true } });
+  const out = await client.deleteNamespace("default");
+  assert.equal(out.protected, true);
+  assert.equal(out.deleted, false);
+  assert.equal(calls[0].init.method, "DELETE");
+  assert.equal(calls[0].url, "http://127.0.0.1:7999/v1/namespaces/default");
+});
+
+test("deleteNamespace rejects an empty name", () => {
+  const { client, calls } = recordClient();
+  assert.throws(() => client.deleteNamespace(""), /deleteNamespace: name must not be empty/);
+  assert.equal(calls.length, 0);
+});
+
+test("namespace methods honour a scoped client namespace header", async () => {
+  const { client, calls } = recordClient({ namespace: "team-a" });
+  await client.listNamespaces();
+  assert.equal(calls[0].init.headers["x-namespace"], "team-a");
+});
