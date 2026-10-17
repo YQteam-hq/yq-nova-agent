@@ -157,3 +157,43 @@ test("withNamespace returns a scoped copy carrying all options", async () => {
   // The scoped client validates its input too.
   assert.throws(() => client.withNamespace("bad name"), /invalid characters/);
 });
+
+test("withNamespace carries timeoutMs over", async () => {
+  const calls = [];
+  // A fetch stub that honours AbortSignal, so the timeout is observable.
+  const slowFetch = (url, init) =>
+    new Promise((resolve, reject) => {
+      calls.push({ url, init });
+      const timer = setTimeout(() => resolve(new Response("{}")), 200);
+      init.signal?.addEventListener("abort", () => {
+        clearTimeout(timer);
+        const err = new Error("aborted");
+        err.name = "AbortError";
+        reject(err);
+      });
+    });
+  const client = new NovaClient("http://127.0.0.1:7999", {
+    apiKey: "k",
+    timeoutMs: 10,
+    fetch: slowFetch,
+  });
+  const scoped = client.withNamespace("team-b");
+  await assert.rejects(
+    () => scoped.health(),
+    (err) => err instanceof NovaApiError && err.code === "timeout",
+    "the scoped client must inherit the original timeout",
+  );
+  assert.equal(calls[0].init.headers["Authorization"], "Bearer k");
+  assert.equal(calls[0].init.headers["x-namespace"], "team-b");
+});
+
+test("invalid timeoutMs is rejected", () => {
+  const stub = async () => new Response("{}", { status: 200 });
+  for (const timeoutMs of [-1, Number.NaN, Number.POSITIVE_INFINITY]) {
+    assert.throws(
+      () => new NovaClient("http://127.0.0.1:7999", { timeoutMs, fetch: stub }),
+      /timeoutMs must be a finite/,
+      `expected rejection for timeoutMs=${timeoutMs}`,
+    );
+  }
+});

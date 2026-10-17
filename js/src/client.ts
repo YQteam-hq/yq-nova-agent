@@ -42,16 +42,25 @@ export interface NovaClientOptions {
 }
 
 // A namespace travels in the `x-namespace` HTTP header, so only characters
-// that are safe inside a header value are accepted: the name must start with
-// an alphanumeric character and may then contain alphanumerics, hyphens and
-// underscores. This structurally rules out header injection (CR/LF/colon).
+// that are safe inside a header value are accepted:
+//   [A-Za-z0-9]    - the first character must be an ASCII letter or digit
+//   [A-Za-z0-9_-]* - the remainder may be letters, digits, hyphens or
+//                    underscores (anchored by ^ and $)
+// This structurally rules out header injection (CR/LF/colon/space).
 const NAMESPACE_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 
-function validateNamespace(name: string, where: string): string {
+/** Trim `name`, rejecting empty or whitespace-only input. */
+function ensureNonEmptyName(name: string, where: string): string {
   const cleaned = name.trim();
   if (!cleaned) {
     throw new Error(`${where}: name must not be empty`);
   }
+  return cleaned;
+}
+
+/** Validate a tenant namespace name, returning it stripped. */
+function validateNamespace(name: string, where: string): string {
+  const cleaned = ensureNonEmptyName(name, where);
   if (!NAMESPACE_RE.test(cleaned)) {
     throw new Error(
       `${where}: '${cleaned}' contains invalid characters; a namespace must start ` +
@@ -60,6 +69,14 @@ function validateNamespace(name: string, where: string): string {
     );
   }
   return cleaned;
+}
+
+/** Validate a request timeout in milliseconds. */
+function validateTimeout(timeoutMs: number): number {
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
+    throw new Error("timeoutMs must be a finite, non-negative number of milliseconds");
+  }
+  return timeoutMs;
 }
 
 export class NovaApiError extends Error {
@@ -94,9 +111,13 @@ export class NovaClient {
     if (!baseUrl) {
       throw new Error("baseUrl must not be empty");
     }
-    this.baseUrl = baseUrl.replace(/\/+$/, "");
+    const base = baseUrl.trim().replace(/\/+$/, "");
+    if (!base) {
+      throw new Error("baseUrl must not be empty");
+    }
+    this.baseUrl = base;
     this.apiKey = options.apiKey;
-    this.timeoutMs = options.timeoutMs ?? 30000;
+    this.timeoutMs = validateTimeout(options.timeoutMs ?? 30000);
     this.namespace = validateNamespace(options.namespace ?? "default", "namespace");
     this.fetchImpl = options.fetch ?? ((typeof globalThis !== "undefined" && globalThis.fetch) as typeof fetch);
     if (!this.fetchImpl) {
@@ -104,20 +125,16 @@ export class NovaClient {
     }
   }
 
-  /** Return a copy of this client scoped to another namespace. */
+  /** Return a new client scoped to another namespace. */
   withNamespace(name: string): NovaClient {
-    // Copying the instance keeps every configuration attribute (including any
-    // added in the future) instead of re-listing them here.
-    const clone: NovaClient = Object.assign(Object.create(Object.getPrototypeOf(this)), this);
-    // `namespace` is readonly for callers; this is the one intentional
-    // mutation of the fresh copy.
-    Object.defineProperty(clone, "namespace", {
-      value: validateNamespace(name, "withNamespace"),
-      writable: true,
-      enumerable: true,
-      configurable: true,
+    // A fresh instance keeps every property immutable. When a new
+    // configuration option is added it must be forwarded here as well.
+    return new NovaClient(this.baseUrl, {
+      apiKey: this.apiKey,
+      timeoutMs: this.timeoutMs,
+      namespace: validateNamespace(name, "withNamespace"),
+      fetch: this.fetchImpl,
     });
-    return clone;
   }
 
   health() {
