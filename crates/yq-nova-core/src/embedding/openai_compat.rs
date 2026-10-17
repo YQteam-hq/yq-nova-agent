@@ -145,6 +145,9 @@ impl OpenAiCompatProvider {
             let status = res.status();
             if !status.is_success() {
                 let text = res.text().await.unwrap_or_default();
+                // 400 is the shared snippet budget across every provider: long
+                // enough to identify the upstream problem, short enough to keep
+                // logs readable. It only shapes diagnostics, never behavior.
                 let snippet = truncate_utf8(&text, 400);
                 return Err((
                     classify_http_status(status),
