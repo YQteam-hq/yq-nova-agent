@@ -1,3 +1,10 @@
+//! Text chunking for long memory content.
+//!
+//! Both split modes slice on UTF-8 character boundaries, so multi-byte text
+//! (CJK, emoji, combining marks) is chunked without panicking. `max_chars`
+//! is a character budget for [`SplitBy::Char`] and a byte budget when
+//! accumulating paragraphs in [`SplitBy::Paragraph`].
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -126,9 +133,8 @@ fn chunk_by_char(text: &str, max_chars: usize, overlap_chars: usize) -> Vec<Stri
     let step = max_chars.saturating_sub(overlap_chars);
     let step = if step == 0 { 1 } else { step };
 
-    // Byte offset of every char boundary, computed once so that each chunk
-    // slice starts and ends on a boundary and never splits a multi-byte
-    // UTF-8 character.
+    // Pre-compute char boundaries for safe slicing. This adds O(n) time and
+    // space complexity but prevents panics on multi-byte UTF-8 characters.
     let mut char_bounds: Vec<usize> = Vec::with_capacity(total_chars + 1);
     char_bounds.extend(text.char_indices().map(|(byte_idx, _)| byte_idx));
     char_bounds.push(text.len());
