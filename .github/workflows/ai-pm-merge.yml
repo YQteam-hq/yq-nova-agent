@@ -95,6 +95,18 @@ jobs:
               return;
             }
 
+            // Governance: PRs that touch .github/ (workflow definitions, etc.)
+            // are reviewed and merged by humans only. The PM does not
+            // participate at all; the specialized reviewer bots may still run.
+            const prFiles = await github.paginate(github.rest.pulls.listFiles, {
+              owner, repo, pull_number: pr.number, per_page: 100,
+            });
+            const touchesDotGithub = prFiles.some((f) => f.filename.indexOf(".github/") === 0);
+            if (touchesDotGithub) {
+              core.info("This PR touches .github/; the PM does not participate (human review required). Skipping.");
+              return;
+            }
+
             // Collect the latest review state per reviewer bot.
             const reviews = await github.paginate(github.rest.pulls.listReviews, {
               owner, repo, pull_number: pr.number, per_page: 100,
