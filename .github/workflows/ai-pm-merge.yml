@@ -18,7 +18,7 @@ permissions:
   issues: write
 
 concurrency:
-  group: ai-pm-merge-${{ github.event.pull_request.number || github.run_id }}
+  group: ai-glm-single
   cancel-in-progress: false
 
 jobs:

@@ -10,8 +10,8 @@ permissions:
   issues: write
 
 concurrency:
-  group: ai-performance-review-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  group: ai-glm-single
+  cancel-in-progress: false
 
 jobs:
   review:
