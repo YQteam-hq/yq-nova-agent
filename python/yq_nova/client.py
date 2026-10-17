@@ -500,6 +500,87 @@ class Client:
         body = {"text": text, "opts": merged}
         return self._request("POST", "/v1/graph/extract-and-link", body)
 
+    # ------------------------------------------------------------------
+    # Namespace management (admin).
+    #
+    # The server exposes these routes to admin-scoped tokens only; a
+    # tenant-scoped key receives 403. `self.namespace` still rides along on
+    # every call because the header is required by the auth middleware.
+    # ------------------------------------------------------------------
+
+    def list_namespaces(self, limit: int = 100, offset: int = 0) -> Dict[str, Any]:
+        """List tenant namespaces.
+
+        Args:
+            limit: Maximum number of namespaces to return. Must be >= 1.
+            offset: Number of namespaces to skip, for pagination.
+        """
+        if limit < 1:
+            raise ValueError("list_namespaces: limit must be >= 1")
+        if offset < 0:
+            raise ValueError("list_namespaces: offset must be >= 0")
+        return self._request(
+            "GET",
+            "/v1/namespaces",
+            params={"limit": limit, "offset": offset},
+        )
+
+    def get_namespace(self, name: str) -> Dict[str, Any]:
+        """Fetch a single namespace by name."""
+        cleaned = _ensure_non_empty(name, "get_namespace")
+        return self._request("GET", f"/v1/namespaces/{_quote(cleaned)}")
+
+    def create_namespace(
+        self,
+        name: str,
+        description: Optional[str] = None,
+        config: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Create a new tenant namespace.
+
+        The name must satisfy the same character rules as the `x-namespace`
+        header so that the returned namespace can be used with
+        `with_namespace`. The reserved name `default` cannot be created.
+        """
+        cleaned = _validate_namespace(name, "create_namespace")
+        if cleaned.lower() == "default":
+            raise ValueError("create_namespace: 'default' is a reserved name")
+        body = {
+            "name": cleaned,
+            "description": description,
+            "config": config if config is not None else {},
+        }
+        return self._request("POST", "/v1/namespaces", body)
+
+    def update_namespace(
+        self,
+        name: str,
+        description: Optional[str] = None,
+        config: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Update a namespace description and/or config.
+
+        Omitted arguments are left untouched by the server, so pass only the
+        fields that should change. There is intentionally no way to rename a
+        namespace; create the target and migrate instead.
+        """
+        cleaned = _ensure_non_empty(name, "update_namespace")
+        body: Dict[str, Any] = {}
+        if description is not None:
+            body["description"] = description
+        if config is not None:
+            body["config"] = config
+        return self._request("PATCH", f"/v1/namespaces/{_quote(cleaned)}", body)
+
+    def delete_namespace(self, name: str) -> Dict[str, Any]:
+        """Delete a namespace.
+
+        The server refuses to remove the built-in `default` namespace; the
+        response reports `protected: true` when it declines.
+        """
+        cleaned = _ensure_non_empty(name, "delete_namespace")
+        return self._request("DELETE", f"/v1/namespaces/{_quote(cleaned)}")
+
 def _quote(value: str) -> str:
 
     return urllib.parse.quote(value, safe="")
