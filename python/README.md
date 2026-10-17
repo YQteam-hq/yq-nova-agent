@@ -76,6 +76,37 @@ digits, hyphens and underscores. Empty, blank or otherwise unsafe names
 (for example names containing spaces, colons or newlines) raise
 `ValueError`.
 
+### Managing namespaces
+
+An admin-scoped API key can also create and manage namespaces. The client
+exposes the full set of namespace routes:
+
+```python
+admin = Client("http://127.0.0.1:7999", api_key="<admin-key>")
+
+admin.create_namespace("team-a", description="Team A", config={"tier": "gold"})
+admin.list_namespaces(limit=50, offset=0)
+admin.get_namespace("team-a")
+
+# Only the fields you pass are changed; the rest keep their stored values.
+admin.update_namespace("team-a", description="Team A (EU)")
+
+admin.delete_namespace("team-a")
+```
+
+A few behaviours worth knowing:
+
+- `create_namespace` rejects the reserved name `default` (case-insensitively)
+  and enforces the same character rules as `with_namespace`, so any namespace
+  you create can immediately be used with `with_namespace(name)`.
+- `update_namespace` sends only the arguments you provide, so omitted fields
+  are left untouched. There is no rename operation; create the target
+  namespace and migrate instead.
+- `delete_namespace` returns a dict with `deleted` and `protected` flags. The
+  built-in `default` namespace is protected and is never removed.
+- Tenant-scoped keys may only read their own namespace; creating, updating
+  another tenant or deleting anything returns `403` from the server.
+
 ## Graph operations
 
 ```python
