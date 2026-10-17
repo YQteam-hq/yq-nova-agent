@@ -1,0 +1,5 @@
+# Governance: changes under .github/ (workflow definitions, templates,
+# CI config) are reviewed and merged by humans only. The PM bot does
+# not participate in such PRs; reviewer bots may still run.
+# Any of the human members listed below may review and approve.
+/.github/ @YQteam-dyq @YQteam-Iris @YQteam-Theodore
