@@ -18,6 +18,7 @@ function recordClient(opts = {}) {
   };
   const client = new NovaClient("http://127.0.0.1:7999", {
     apiKey: "k",
+    namespace: opts.namespace,
     fetch: stubFetch,
   });
   return { client, calls };
@@ -97,4 +98,120 @@ test("non-2xx responses throw NovaApiError", async () => {
 
 test("empty base url is rejected", () => {
   assert.throws(() => new NovaClient(""), /must not be empty/);
+});
+
+test("x-namespace header defaults to \"default\" and can be configured", async () => {
+  const def = recordClient();
+  await def.client.health();
+  assert.equal(def.calls[0].init.headers["x-namespace"], "default");
+
+  const scoped = recordClient({ namespace: "team-a" });
+  await scoped.client.health();
+  assert.equal(scoped.calls[0].init.headers["x-namespace"], "team-a");
+
+  // Namespaces are stripped of surrounding whitespace.
+  const padded = recordClient({ namespace: "  team-a  " });
+  await padded.client.health();
+  assert.equal(padded.calls[0].init.headers["x-namespace"], "team-a");
+});
+
+test("unsafe namespace names are rejected", () => {
+  // The namespace is sent in the x-namespace header, so characters that could
+  // split or forge a header must be rejected.
+  for (const name of [
+    "team\na", // newline injection
+    "team\r\nX-Evil: 1", // CRLF header splitting
+    "team a", // space inside the name
+    "team:a", // colon
+    "-team", // must start alphanumeric
+    "team/../etc", // path characters
+    "team\u00e9", // non-ASCII letter
+    "team\x00", // NUL byte
+  ]) {
+    assert.throws(
+      () => new NovaClient("http://127.0.0.1:7999", { namespace: name, fetch: async () => {} }),
+      /invalid characters/,
+      `expected rejection for ${JSON.stringify(name)}`,
+    );
+  }
+  assert.throws(
+    () => new NovaClient("http://127.0.0.1:7999", { namespace: "   ", fetch: async () => {} }),
+    /must not be empty/,
+  );
+});
+
+test("withNamespace returns a scoped copy carrying all options", async () => {
+  const { client, calls } = recordClient({ namespace: "team-a" });
+  const scoped = client.withNamespace("team-b");
+  assert.notEqual(scoped, client);
+
+  await scoped.remember({ content: "hello" });
+  assert.equal(calls[0].init.headers["x-namespace"], "team-b");
+  assert.equal(calls[0].init.headers["Authorization"], "Bearer k");
+  assert.equal(calls[0].init.headers["Content-Type"], "application/json");
+
+  // The original client is untouched and still sends its own namespace.
+  await client.remember({ content: "hello" });
+  assert.equal(calls[1].init.headers["x-namespace"], "team-a");
+
+  // The scoped client validates its input too.
+  assert.throws(() => client.withNamespace("bad name"), /invalid characters/);
+});
+
+test("withNamespace reports validation errors under its own name", () => {
+  // The `where` label must name the method the caller used, so the message
+  // never says "namespace" for a `withNamespace` call.
+  const { client } = recordClient();
+  const startsWith = (prefix) => (err) =>
+    err instanceof Error && err.message.startsWith(prefix);
+  assert.throws(
+    () => client.withNamespace("bad name"),
+    startsWith("withNamespace: 'bad name' contains invalid characters"),
+  );
+  assert.throws(() => client.withNamespace("   "), startsWith("withNamespace: name must not be empty"));
+  // The constructor keeps its own label.
+  assert.throws(
+    () => new NovaClient("http://127.0.0.1:7999", { namespace: "bad name" }),
+    startsWith("namespace: 'bad name' contains invalid characters"),
+  );
+});
+
+test("withNamespace carries timeoutMs over", async () => {
+  const calls = [];
+  // A fetch stub that honours AbortSignal, so the timeout is observable.
+  const slowFetch = (url, init) =>
+    new Promise((resolve, reject) => {
+      calls.push({ url, init });
+      const timer = setTimeout(() => resolve(new Response("{}")), 200);
+      init.signal?.addEventListener("abort", () => {
+        clearTimeout(timer);
+        const err = new Error("aborted");
+        err.name = "AbortError";
+        reject(err);
+      });
+    });
+  const client = new NovaClient("http://127.0.0.1:7999", {
+    apiKey: "k",
+    timeoutMs: 10,
+    fetch: slowFetch,
+  });
+  const scoped = client.withNamespace("team-b");
+  await assert.rejects(
+    () => scoped.health(),
+    (err) => err instanceof NovaApiError && err.code === "timeout",
+    "the scoped client must inherit the original timeout",
+  );
+  assert.equal(calls[0].init.headers["Authorization"], "Bearer k");
+  assert.equal(calls[0].init.headers["x-namespace"], "team-b");
+});
+
+test("invalid timeoutMs is rejected", () => {
+  const stub = async () => new Response("{}", { status: 200 });
+  for (const timeoutMs of [-1, Number.NaN, Number.POSITIVE_INFINITY]) {
+    assert.throws(
+      () => new NovaClient("http://127.0.0.1:7999", { timeoutMs, fetch: stub }),
+      /timeoutMs must be a finite/,
+      `expected rejection for timeoutMs=${timeoutMs}`,
+    );
+  }
 });

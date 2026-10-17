@@ -49,6 +49,26 @@ const client = new NovaClient("http://127.0.0.1:7999", {
 });
 ```
 
+## Multi-tenancy
+
+The server isolates data per namespace (v0.4.0+). Pass a `namespace` option and
+it is sent as the `x-namespace` header on every request:
+
+```ts
+const client = new NovaClient("http://127.0.0.1:7999", {
+  apiKey: "optional-key",
+  namespace: "team-a",
+});
+
+// Or derive a scoped copy from an existing client:
+const scoped = client.withNamespace("team-b");
+```
+
+A namespace must start with a letter or digit and may then contain only
+letters, digits, hyphens and underscores. Because the name travels in an HTTP
+header, characters that could split or forge a header (CR/LF, colon, spaces,
+non-ASCII, NUL) are rejected with an `Error`.
+
 ## API coverage
 
 | Method | HTTP endpoint |

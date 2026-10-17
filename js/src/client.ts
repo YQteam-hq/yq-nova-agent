@@ -37,7 +37,46 @@ import type {
 export interface NovaClientOptions {
   apiKey?: string;
   timeoutMs?: number;
+  namespace?: string;
   fetch?: typeof fetch;
+}
+
+// A namespace travels in the `x-namespace` HTTP header, so only characters
+// that are safe inside a header value are accepted:
+//   [A-Za-z0-9]    - the first character must be an ASCII letter or digit
+//   [A-Za-z0-9_-]* - the remainder may be letters, digits, hyphens or
+//                    underscores (anchored by ^ and $)
+// This structurally rules out header injection (CR/LF/colon/space).
+const NAMESPACE_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
+
+/** Trim `name`, rejecting empty or whitespace-only input. */
+function ensureNonEmptyName(name: string, where: string): string {
+  const cleaned = name.trim();
+  if (!cleaned) {
+    throw new Error(`${where}: name must not be empty`);
+  }
+  return cleaned;
+}
+
+/** Validate a tenant namespace name, returning it stripped. */
+function validateNamespace(name: string, where: string): string {
+  const cleaned = ensureNonEmptyName(name, where);
+  if (!NAMESPACE_RE.test(cleaned)) {
+    throw new Error(
+      `${where}: '${cleaned}' contains invalid characters; a namespace must start ` +
+        "with a letter or digit and may then contain only letters, digits, " +
+        "hyphens and underscores",
+    );
+  }
+  return cleaned;
+}
+
+/** Validate a request timeout in milliseconds. */
+function validateTimeout(timeoutMs: number): number {
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
+    throw new Error("timeoutMs must be a finite, non-negative number of milliseconds");
+  }
+  return timeoutMs;
 }
 
 export class NovaApiError extends Error {
@@ -65,19 +104,42 @@ export class NovaClient {
   private readonly baseUrl: string;
   private readonly apiKey?: string;
   private readonly timeoutMs: number;
+  private readonly namespace: string;
   private readonly fetchImpl: typeof fetch;
+  private readonly options: NovaClientOptions;
 
   constructor(baseUrl: string, options: NovaClientOptions = {}) {
     if (!baseUrl) {
       throw new Error("baseUrl must not be empty");
     }
-    this.baseUrl = baseUrl.replace(/\/+$/, "");
+    const base = baseUrl.trim().replace(/\/+$/, "");
+    if (!base) {
+      throw new Error("baseUrl must not be empty");
+    }
+    this.baseUrl = base;
     this.apiKey = options.apiKey;
-    this.timeoutMs = options.timeoutMs ?? 30000;
+    // The default applies only when the caller omits the option; whatever is
+    // used afterwards has been through validateTimeout, which throws on NaN,
+    // Infinity and negative input.
+    const timeoutMs = options.timeoutMs ?? 30000;
+    this.timeoutMs = validateTimeout(timeoutMs);
+    this.namespace = validateNamespace(options.namespace ?? "default", "namespace");
     this.fetchImpl = options.fetch ?? ((typeof globalThis !== "undefined" && globalThis.fetch) as typeof fetch);
     if (!this.fetchImpl) {
       throw new Error("A fetch implementation is required; Node 18+ and browsers provide one globally");
     }
+    this.options = { ...options };
+  }
+
+  /** Return a new client scoped to another namespace. */
+  withNamespace(name: string): NovaClient {
+    // Why spreading instead of naming each option: an explicit list would
+    // silently drop any option added to `NovaClientOptions` later, while the
+    // stored options are a copy of exactly what the caller passed. The
+    // constructor still runs every validation and returns a fresh instance,
+    // so no property of this client is ever mutated.
+    const namespace = validateNamespace(name, "withNamespace");
+    return new NovaClient(this.baseUrl, { ...this.options, namespace });
   }
 
   health() {
@@ -181,7 +243,10 @@ export class NovaClient {
     const query = params ? this.encodeParams(params) : "";
     const url = this.baseUrl + path + (query ? `?${query}` : "");
 
-    const headers: Record<string, string> = { Accept: "application/json" };
+    const headers: Record<string, string> = {
+      Accept: "application/json",
+      "x-namespace": this.namespace,
+    };
     let payload: BodyInit | undefined;
     if (body !== undefined) {
       headers["Content-Type"] = "application/json";
