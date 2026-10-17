@@ -106,6 +106,7 @@ export class NovaClient {
   private readonly timeoutMs: number;
   private readonly namespace: string;
   private readonly fetchImpl: typeof fetch;
+  private readonly options: NovaClientOptions;
 
   constructor(baseUrl: string, options: NovaClientOptions = {}) {
     if (!baseUrl) {
@@ -123,18 +124,16 @@ export class NovaClient {
     if (!this.fetchImpl) {
       throw new Error("A fetch implementation is required; Node 18+ and browsers provide one globally");
     }
+    this.options = { ...options };
   }
 
   /** Return a new client scoped to another namespace. */
   withNamespace(name: string): NovaClient {
-    // A fresh instance keeps every property immutable. When a new
-    // configuration option is added it must be forwarded here as well.
-    return new NovaClient(this.baseUrl, {
-      apiKey: this.apiKey,
-      timeoutMs: this.timeoutMs,
-      namespace: validateNamespace(name, "withNamespace"),
-      fetch: this.fetchImpl,
-    });
+    // Spreading the stored options keeps future configuration options covered
+    // without listing them here, and returning a fresh instance keeps every
+    // property immutable.
+    const namespace = validateNamespace(name, "withNamespace");
+    return new NovaClient(this.baseUrl, { ...this.options, namespace });
   }
 
   health() {
