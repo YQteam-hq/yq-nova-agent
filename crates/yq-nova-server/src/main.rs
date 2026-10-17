@@ -734,7 +734,7 @@ async fn wait_for_shutdown_signal() -> NovaResult<()> {
             .ok_or_else(|| (std::io::Error::other("sigterm stream closed"), "sigterm"))
     };
     #[cfg(not(unix))]
-    let terminate = std::future::pending::<Result<_, _>>();
+    let terminate = std::future::pending::<Result<(), (std::io::Error, &'static str)>>();
 
     tokio::select! {
         r = ctrl_c => { r.map(|_| ()).map_err(|(e, ctx)| yq_nova_core::NovaError::internal_with_ctx(ctx, e)) }
