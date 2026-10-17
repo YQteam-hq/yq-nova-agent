@@ -32,13 +32,28 @@ class Client:
         base_url: str,
         api_key: Optional[str] = None,
         timeout: float = 30.0,
+        namespace: str = "default",
     ) -> None:
         base = base_url.rstrip("/")
         if not base:
             raise ValueError("base_url must not be empty")
+        if not namespace or not namespace.strip():
+            raise ValueError("namespace must not be empty")
         self.base_url = base
         self.api_key = api_key
         self.timeout = timeout
+        self.namespace = namespace
+
+    def with_namespace(self, name: str) -> "Client":
+        """Return a copy of this client scoped to another namespace."""
+        if not name or not name.strip():
+            raise ValueError("with_namespace: name must be non-empty")
+        return Client(
+            self.base_url,
+            api_key=self.api_key,
+            timeout=self.timeout,
+            namespace=name,
+        )
 
     def _request(
         self,
@@ -55,6 +70,7 @@ class Client:
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
+            "x-namespace": self.namespace,
         }
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"

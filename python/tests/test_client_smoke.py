@@ -45,8 +45,32 @@ def test_client_side_validation():
         except ValueError:
             pass
 
+def test_namespace_scoping():
+    client = Client("http://127.0.0.1:7999")
+    assert client.namespace == "default"
+
+    scoped = client.with_namespace("team-a")
+    assert scoped.namespace == "team-a"
+    assert client.namespace == "default"
+
+    direct = Client("http://127.0.0.1:7999", namespace="team-b")
+    assert direct.namespace == "team-b"
+
+    try:
+        Client("http://127.0.0.1:7999", namespace="")
+        assert False, "expected ValueError for empty namespace"
+    except ValueError:
+        pass
+
+    try:
+        client.with_namespace("   ")
+        assert False, "expected ValueError for blank namespace"
+    except ValueError:
+        pass
+
 if __name__ == "__main__":
     test_imports_and_construction()
     test_error_type_attributes()
     test_client_side_validation()
+    test_namespace_scoping()
     print("all smoke tests passed")
