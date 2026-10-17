@@ -99,10 +99,57 @@ def test_namespace_rejects_unsafe_characters():
         c = Client("http://127.0.0.1:7999", namespace=name)
         assert c.namespace == name.strip()
 
+def test_namespace_regex_boundaries():
+    # Direct coverage for the _NAMESPACE_RE pattern itself, independent of
+    # the Client wrapper: the first character must be alphanumeric and the
+    # remainder may only contain alphanumerics, hyphens and underscores.
+    from yq_nova.client import _NAMESPACE_RE
+
+    valid = [
+        "a", "Z", "0", "9", "team-a", "team_b", "A-b_C-9",
+        "x" * 512, "0" * 100, "-".join("abcdefghij"),
+    ]
+    for name in valid:
+        assert _NAMESPACE_RE.match(name), f"expected {name!r} to match"
+
+    invalid = [
+        "",                  # empty
+        "-team",             # leading hyphen
+        "_team",             # leading underscore
+        "team a",            # embedded space
+        "team\ta",           # embedded tab
+        "team\na",           # embedded newline
+        "team\r\nX-Evil: 1", # CRLF header splitting
+        "team:a",            # colon
+        "team/../etc",       # path characters
+        "t\u00e9am",         # non-ASCII letter
+        "team\x00",          # NUL byte
+        "team.",             # dot
+        "team+",             # plus sign
+        "team%20",           # percent-encoding
+        "team;",             # semicolon
+    ]
+    for name in invalid:
+        assert not _NAMESPACE_RE.match(name), f"expected {name!r} to be rejected"
+
+def test_with_namespace_copies_all_attributes():
+    client = Client("http://127.0.0.1:7999", api_key="secret-key", timeout=12.5)
+    scoped = client.with_namespace("team-a")
+    # The scoped client must carry over every configuration attribute, not
+    # just the ones enumerated in its implementation.
+    assert scoped is not client
+    assert scoped.base_url == client.base_url
+    assert scoped.api_key == client.api_key
+    assert scoped.timeout == client.timeout
+    assert scoped.namespace == "team-a"
+    assert client.namespace == "default"
+
 if __name__ == "__main__":
     test_imports_and_construction()
     test_error_type_attributes()
     test_client_side_validation()
     test_namespace_scoping()
     test_namespace_rejects_unsafe_characters()
+    test_namespace_regex_boundaries()
+    test_with_namespace_copies_all_attributes()
     print("all smoke tests passed")

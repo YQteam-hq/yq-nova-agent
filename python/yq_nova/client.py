@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import re
 import urllib.error
@@ -15,15 +16,26 @@ from typing import Any, Dict, List, Optional
 _NAMESPACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 
 
-def _validate_namespace(name: str, where: str) -> str:
-    """Validate a tenant namespace name, returning it stripped."""
-    if not name or not name.strip():
-        raise ValueError(f"{where}: name must not be empty")
+def _ensure_non_empty(name: str, where: str) -> str:
+    """Strip `name` and reject empty or whitespace-only input."""
     cleaned = name.strip()
+    if not cleaned:
+        raise ValueError(f"{where}: name must not be empty")
+    return cleaned
+
+
+def _validate_namespace(name: str, where: str) -> str:
+    """Validate a tenant namespace name, returning it stripped.
+
+    Raises a ValueError whose message distinguishes empty input from a name
+    containing characters that are unsafe inside the `x-namespace` header.
+    """
+    cleaned = _ensure_non_empty(name, where)
     if not _NAMESPACE_RE.match(cleaned):
         raise ValueError(
-            f"{where}: name must start with a letter or digit and contain "
-            "only letters, digits, hyphens and underscores"
+            f"{where}: {cleaned!r} contains invalid characters; a namespace "
+            "must start with a letter or digit and may then contain only "
+            "letters, digits, hyphens and underscores"
         )
     return cleaned
 
@@ -64,12 +76,11 @@ class Client:
 
     def with_namespace(self, name: str) -> "Client":
         """Return a copy of this client scoped to another namespace."""
-        return Client(
-            self.base_url,
-            api_key=self.api_key,
-            timeout=self.timeout,
-            namespace=_validate_namespace(name, "with_namespace"),
-        )
+        # Copying the instance keeps every configuration attribute (including
+        # any added in the future) instead of re-listing them here.
+        clone = copy.copy(self)
+        clone.namespace = _validate_namespace(name, "with_namespace")
+        return clone
 
     def _request(
         self,
