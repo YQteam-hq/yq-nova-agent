@@ -4,7 +4,16 @@ All notable changes to **yq-nova-agent** are documented in this file. The projec
 
 ## [Unreleased]
 
+### Added
+- JS SDK: concrete return types for the remaining untyped endpoints — `ExportOutput`, `TagRenameOutput`, `TagDeleteOutput`, `TraverseNode`, `ExtractLinkOutput` and `EntityCandidate` — so no method returns `Record<string, unknown>` any more.
+- JS SDK: `npm run typecheck:tests`, a compile-time contract test (`test/types.contract.ts`) that fails the build if a declared response type drifts from the server's wire format. Wired into `npm test`.
+- LangChain and LlamaIndex integrations: new knowledge-graph tool sets (`create_graph_tools`, plus `create_all_tools` for the memory and graph tools combined). The five new tools are `nova_list_entities`, `nova_traverse`, `nova_list_relations`, `nova_link_entities` and `nova_extract_graph`, letting an agent inspect and extend the entity-relation graph that recall already traverses. Traversal depth and node count are capped by default, and arguments are validated before any request is issued.
+- Rust SDK (`EmbeddedNova`): `list_entities`, `upsert_relation` and `list_relations`, closing the gap with `HttpClient` so in-process callers can query and write the entity graph without an HTTP round trip. Filters, pagination and the `MAX_GRAPH_PAGE` limit clamp behave the same as the equivalent HTTP routes.
+- Python SDK: namespace management methods `list_namespaces`, `get_namespace`, `create_namespace`, `update_namespace` and `delete_namespace`, mirroring the existing `/v1/namespaces` routes. `create_namespace` rejects the reserved `default` name and enforces the same character rules as `with_namespace`; `update_namespace` sends only the fields you pass so the server leaves the rest untouched.
+- JS SDK: the same five namespace management methods (`listNamespaces`, `getNamespace`, `createNamespace`, `updateNamespace`, `deleteNamespace`) together with the `NamespaceRecord`, `NamespaceListOutput`, `ListNamespacesParams`, `CreateNamespaceInput`, `UpdateNamespaceInput` and `DeleteNamespaceOutput` types.
+
 ### Fixed
+- JS SDK: `MergeEntitiesOutput` declared a `discard_uuids` field that the server never returns. The response is `{ kept_uuid, merged, remapped_relations }`, so `out.merged` and `out.remapped_relations` did not type-check and `out.discard_uuids` typed as `string[]` while being `undefined` at runtime.
 - `RetryConfig` with `max_attempts = 0` no longer panics: the attempt budget is clamped to one, so a misconfigured deployment retries once and reports an embedding error instead of aborting the request task. Callers relied on an error being returned here, never on the panic, so this is a bug fix rather than a behavior contract change.
 - A `RetryConfig` whose `base_sleep` exceeds `max_sleep` no longer panics on the first retry; the sleep window is clamped so the sampling range stays valid.
 - Retry backoff now uses saturating duration multiplication, so extreme `base_sleep` values cannot overflow.

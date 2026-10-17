@@ -69,6 +69,35 @@ letters, digits, hyphens and underscores. Because the name travels in an HTTP
 header, characters that could split or forge a header (CR/LF, colon, spaces,
 non-ASCII, NUL) are rejected with an `Error`.
 
+### Managing namespaces
+
+An admin-scoped API key can also manage the namespaces themselves:
+
+```ts
+await client.createNamespace({ name: "team-a", description: "Team A", config: { tier: "gold" } });
+await client.listNamespaces({ limit: 50, offset: 0 });
+await client.getNamespace("team-a");
+
+// Only the fields you pass are sent; the rest keep their stored values.
+await client.updateNamespace("team-a", { description: "Team A (EU)" });
+
+const result = await client.deleteNamespace("team-a");
+console.log(result.deleted, result.protected);
+```
+
+A few behaviours worth knowing:
+
+- `createNamespace` validates the name against the same rule as
+  `withNamespace`, so any namespace you create can immediately be scoped to. The
+  reserved name `default` is rejected case-insensitively.
+- `updateNamespace` sends only the keys present in the input object. Omitted
+  fields are left untouched, while `description: ""` clears the description.
+  There is no rename operation.
+- `deleteNamespace` never removes the built-in `default` namespace; the result
+  reports `protected: true` in that case.
+- Tenant-scoped keys may only read their own namespace. Creating, updating
+  another tenant or deleting anything returns `403` from the server.
+
 ## API coverage
 
 | Method | HTTP endpoint |
@@ -96,6 +125,24 @@ non-ASCII, NUL) are rejected with an `Error`.
 | `upsertRelation()` | `POST /v1/graph/relations` |
 | `listRelations()` | `GET /v1/graph/relations` |
 | `traverse()` | `POST /v1/graph/traverse` |
+| `listNamespaces()` | `GET /v1/namespaces` |
+| `getNamespace()` | `GET /v1/namespaces/:name` |
+| `createNamespace()` | `POST /v1/namespaces` |
+| `updateNamespace()` | `PATCH /v1/namespaces/:name` |
+| `deleteNamespace()` | `DELETE /v1/namespaces/:name` |
+
+Every method has a concrete return type, so response fields are checked at
+compile time rather than at runtime:
+
+```ts
+const out = await client.traverse({ start: uuid });
+for (const node of out) {
+  console.log(node.entity.name, node.depth, node.path.length);
+}
+
+const merged = await client.mergeEntities({ keep_uuid: "a", discard_uuids: ["b"] });
+console.log(merged.merged.length, merged.remapped_relations);
+```
 
 ## Errors
 
@@ -108,6 +155,15 @@ Every non-2xx response throws a `NovaApiError` carrying `code`, `message`,
 ```bash
 npm install
 npm run build
+
+# Type-check only, without emitting.
+npm run typecheck
+
+# Type-check the compile-time contract tests in test/types.contract.ts.
+npm run typecheck:tests
+
+# Build, contract tests and runtime tests.
+npm test
 ```
 
 ## License
