@@ -20,7 +20,7 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/YQteam-dyq/yq-nova-agent"
+Homepage = "https://github.com/YQteam-hq/yq-nova-agent"
 
 [tool.setuptools.packages.find]
 include = ["langchain_yq_nova*"]
