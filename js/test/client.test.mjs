@@ -158,6 +158,24 @@ test("withNamespace returns a scoped copy carrying all options", async () => {
   assert.throws(() => client.withNamespace("bad name"), /invalid characters/);
 });
 
+test("withNamespace reports validation errors under its own name", () => {
+  // The `where` label must name the method the caller used, so the message
+  // never says "namespace" for a `withNamespace` call.
+  const { client } = recordClient();
+  const startsWith = (prefix) => (err) =>
+    err instanceof Error && err.message.startsWith(prefix);
+  assert.throws(
+    () => client.withNamespace("bad name"),
+    startsWith("withNamespace: 'bad name' contains invalid characters"),
+  );
+  assert.throws(() => client.withNamespace("   "), startsWith("withNamespace: name must not be empty"));
+  // The constructor keeps its own label.
+  assert.throws(
+    () => new NovaClient("http://127.0.0.1:7999", { namespace: "bad name" }),
+    startsWith("namespace: 'bad name' contains invalid characters"),
+  );
+});
+
 test("withNamespace carries timeoutMs over", async () => {
   const calls = [];
   // A fetch stub that honours AbortSignal, so the timeout is observable.

@@ -129,9 +129,11 @@ export class NovaClient {
 
   /** Return a new client scoped to another namespace. */
   withNamespace(name: string): NovaClient {
-    // Spreading the stored options keeps future configuration options covered
-    // without listing them here, and returning a fresh instance keeps every
-    // property immutable.
+    // Why spreading instead of naming each option: an explicit list would
+    // silently drop any option added to `NovaClientOptions` later, while the
+    // stored options are a copy of exactly what the caller passed. The
+    // constructor still runs every validation and returns a fresh instance,
+    // so no property of this client is ever mutated.
     const namespace = validateNamespace(name, "withNamespace");
     return new NovaClient(this.baseUrl, { ...this.options, namespace });
   }
